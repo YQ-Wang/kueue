@@ -202,6 +202,100 @@ func TestAddClusterQueueOrphans(t *testing.T) {
 	}
 }
 
+func TestEnsureClusterQueueReplacesIncarnation(t *testing.T) {
+	ctx, log := utiltesting.ContextWithLog(t)
+	lq := utiltestingapi.MakeLocalQueue("lq", "ns").ClusterQueue("cq").Obj()
+	wl := utiltestingapi.MakeWorkload("wl", lq.Namespace).Queue(kueue.LocalQueueName(lq.Name)).Obj()
+	cl := utiltesting.NewFakeClient(lq, wl)
+	manager := NewManagerForUnitTests(cl, nil)
+
+	oldCQ := utiltestingapi.MakeClusterQueue("cq").Obj()
+	oldCQ.UID = "old"
+	newCQ := oldCQ.DeepCopy()
+	newCQ.UID = "new"
+	if err := manager.AddClusterQueue(ctx, oldCQ); err != nil {
+		t.Fatalf("Adding old ClusterQueue: %v", err)
+	}
+	if err := manager.AddLocalQueue(ctx, lq); err != nil {
+		t.Fatalf("Adding LocalQueue: %v", err)
+	}
+
+	wlKey := workload.Key(wl)
+	oldInfo := manager.hm.ClusterQueue("cq").trackedInfo(wlKey)
+	if oldInfo == nil {
+		t.Fatal("Workload not tracked by old ClusterQueue")
+	}
+	oldInfo.LastAssignment = &workload.AssignmentClusterQueueState{
+		ClusterQueueGeneration: 10,
+	}
+
+	if err := manager.UpdateClusterQueue(ctx, newCQ, false); !errors.Is(err, ErrClusterQueueUIDMismatch) {
+		t.Fatalf("UpdateClusterQueue() error = %v, want %v", err, ErrClusterQueueUIDMismatch)
+	}
+	if err := manager.EnsureClusterQueue(ctx, oldCQ); err != nil {
+		t.Fatalf("Ensuring same incarnation: %v", err)
+	}
+	if manager.hm.ClusterQueue("cq").trackedInfo(wlKey).LastAssignment == nil {
+		t.Fatal("Same-incarnation ensure cleared LastAssignment")
+	}
+
+	if err := manager.EnsureClusterQueue(ctx, newCQ); err != nil {
+		t.Fatalf("Replacing ClusterQueue: %v", err)
+	}
+	replacement := manager.hm.ClusterQueue("cq")
+	if replacement == nil || replacement.uid != newCQ.UID {
+		t.Fatalf("Replacement = %#v, want UID %q", replacement, newCQ.UID)
+	}
+	replacementInfo := replacement.trackedInfo(wlKey)
+	if replacementInfo == nil {
+		t.Fatal("Replacement did not adopt pending workload")
+	}
+	if replacementInfo.LastAssignment != nil {
+		t.Fatalf("Replacement retained LastAssignment: %+v", replacementInfo.LastAssignment)
+	}
+
+	manager.DeleteClusterQueue(log, oldCQ)
+	if got := manager.hm.ClusterQueue("cq"); got == nil || got.uid != newCQ.UID {
+		t.Fatalf("Stale delete removed replacement: %#v", got)
+	}
+}
+
+func TestEnsureClusterQueueAfterDeleteResetsLastAssignment(t *testing.T) {
+	ctx, log := utiltesting.ContextWithLog(t)
+	lq := utiltestingapi.MakeLocalQueue("lq", "ns").ClusterQueue("cq").Obj()
+	wl := utiltestingapi.MakeWorkload("wl", lq.Namespace).Queue(kueue.LocalQueueName(lq.Name)).Obj()
+	cl := utiltesting.NewFakeClient(lq, wl)
+	manager := NewManagerForUnitTests(cl, nil)
+	oldCQ := utiltestingapi.MakeClusterQueue("cq").Obj()
+	oldCQ.UID = "old"
+	newCQ := oldCQ.DeepCopy()
+	newCQ.UID = "new"
+	if err := manager.AddClusterQueue(ctx, oldCQ); err != nil {
+		t.Fatalf("Adding old ClusterQueue: %v", err)
+	}
+	if err := manager.AddLocalQueue(ctx, lq); err != nil {
+		t.Fatalf("Adding LocalQueue: %v", err)
+	}
+	wlKey := workload.Key(wl)
+	manager.hm.ClusterQueue("cq").trackedInfo(wlKey).LastAssignment = &workload.AssignmentClusterQueueState{
+		ClusterQueueGeneration: 10,
+	}
+
+	if deleted := manager.DeleteClusterQueue(log, oldCQ); !deleted {
+		t.Fatal("Deleting old ClusterQueue was rejected")
+	}
+	if err := manager.EnsureClusterQueue(ctx, newCQ); err != nil {
+		t.Fatalf("Adding replacement ClusterQueue: %v", err)
+	}
+	replacementInfo := manager.hm.ClusterQueue("cq").trackedInfo(wlKey)
+	if replacementInfo == nil {
+		t.Fatal("Replacement did not adopt pending workload")
+	}
+	if replacementInfo.LastAssignment != nil {
+		t.Fatalf("Replacement retained LastAssignment after delete/create: %+v", replacementInfo.LastAssignment)
+	}
+}
+
 // TestUpdateClusterQueue tests that a ClusterQueue transfers cohorts on update.
 // Inadmissible workloads should become active.
 func TestUpdateClusterQueue(t *testing.T) {

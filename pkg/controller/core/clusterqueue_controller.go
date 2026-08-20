@@ -18,6 +18,7 @@ package core
 
 import (
 	"context"
+	"fmt"
 	"iter"
 	"math"
 	"slices"
@@ -25,6 +26,7 @@ import (
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -174,6 +176,10 @@ func (r *ClusterQueueReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		)
 	}
 
+	if err := r.ensureClusterQueueCaches(ctx, &cqObj); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	if cqObj.DeletionTimestamp.IsZero() {
 		// Although we'll add the finalizer via webhook mutation now, this is still useful
 		// as a fallback.
@@ -291,6 +297,16 @@ func (r *ClusterQueueReconciler) notifyWatchers(oldCQ, newCQ *kueue.ClusterQueue
 	}
 }
 
+func (r *ClusterQueueReconciler) ensureClusterQueueCaches(ctx context.Context, cq *kueue.ClusterQueue) error {
+	if err := r.cache.EnsureClusterQueue(ctx, cq); err != nil {
+		return fmt.Errorf("ensuring ClusterQueue in scheduler cache: %w", err)
+	}
+	if err := r.qManager.EnsureClusterQueue(ctx, cq); err != nil {
+		return fmt.Errorf("ensuring ClusterQueue in queue manager: %w", err)
+	}
+	return nil
+}
+
 // NotifyResourceFlavorUpdate ignores updates since they have no impact on the ClusterQueue's readiness.
 func (r *ClusterQueueReconciler) NotifyResourceFlavorUpdate(oldRF, newRF *kueue.ResourceFlavor) {
 	var rfName string
@@ -340,12 +356,8 @@ func (r *ClusterQueueReconciler) Create(e event.TypedCreateEvent[*kueue.ClusterQ
 		r.customLabels.CQStore(kueue.ClusterQueueReference(e.Object.GetName()), e.Object.GetLabels(), e.Object.GetAnnotations())
 	}
 
-	if err := r.cache.AddClusterQueue(ctx, e.Object); err != nil {
-		log.Error(err, "Failed to add clusterQueue to cache")
-	}
-
-	if err := r.qManager.AddClusterQueue(ctx, e.Object); err != nil {
-		log.Error(err, "Failed to add clusterQueue to queue manager")
+	if err := r.ensureClusterQueueCaches(ctx, e.Object); err != nil {
+		log.Error(err, "Failed to ensure ClusterQueue caches")
 	}
 
 	if r.reportResourceMetrics {
@@ -356,19 +368,34 @@ func (r *ClusterQueueReconciler) Create(e event.TypedCreateEvent[*kueue.ClusterQ
 }
 
 func (r *ClusterQueueReconciler) Delete(e event.TypedDeleteEvent[*kueue.ClusterQueue]) bool {
-	defer r.notifyWatchers(e.Object, nil)
-
 	log := r.logger()
 	log.V(2).Info("ClusterQueue delete event", "clusterQueue", klog.KObj(e.Object))
-	r.cache.ClearCohortMetrics(log, e.Object.Spec.CohortName)
-	r.cache.DeleteClusterQueue(e.Object)
-	r.qManager.DeleteClusterQueue(log, e.Object)
+	cacheDeleted := r.cache.DeleteClusterQueue(e.Object)
+	queueDeleted := r.qManager.DeleteClusterQueue(log, e.Object)
+	if !cacheDeleted || !queueDeleted {
+		log.V(2).Info("Ignoring stale ClusterQueue delete event because a newer incarnation is cached",
+			"clusterQueue", klog.KObj(e.Object), "uid", e.Object.UID)
+		return true
+	}
+	var current kueue.ClusterQueue
+	if err := r.client.Get(context.Background(), client.ObjectKeyFromObject(e.Object), &current); err == nil {
+		if current.UID != e.Object.UID {
+			log.V(2).Info("Skipping ClusterQueue delete cleanup because the API holds a newer incarnation",
+				"clusterQueue", klog.KObj(&current), "deletedUID", e.Object.UID, "currentUID", current.UID)
+			return true
+		}
+	} else if !apierrors.IsNotFound(err) {
+		log.Error(err, "Unable to verify ClusterQueue incarnation before delete cleanup")
+		return true
+	}
 
+	r.cache.ClearCohortMetrics(log, e.Object.Spec.CohortName)
 	metrics.ClearClusterQueueResourceMetrics(e.Object.Name)
 	if features.Enabled(features.CustomMetricLabels) {
 		r.customLabels.CQDelete(kueue.ClusterQueueReference(e.Object.GetName()))
 	}
 	log.V(2).Info("Cleared resource metrics for deleted ClusterQueue.", "clusterQueue", klog.KObj(e.Object))
+	r.notifyWatchers(e.Object, nil)
 
 	return true
 }
@@ -382,6 +409,7 @@ func (r *ClusterQueueReconciler) Update(e event.TypedUpdateEvent[*kueue.ClusterQ
 	}
 	defer r.notifyWatchers(e.ObjectOld, e.ObjectNew)
 	specUpdated := !equality.Semantic.DeepEqual(e.ObjectOld.Spec, e.ObjectNew.Spec)
+	incarnationChanged := e.ObjectOld.UID != e.ObjectNew.UID
 
 	var labelsUpdated bool
 	if features.Enabled(features.CustomMetricLabels) {
@@ -391,11 +419,18 @@ func (r *ClusterQueueReconciler) Update(e event.TypedUpdateEvent[*kueue.ClusterQ
 		)
 	}
 
-	if err := r.cache.UpdateClusterQueue(log, e.ObjectNew); err != nil {
-		log.Error(err, "Failed to update clusterQueue in cache")
-	}
-	if err := r.qManager.UpdateClusterQueue(context.Background(), e.ObjectNew, specUpdated); err != nil {
-		log.Error(err, "Failed to update clusterQueue in queue manager")
+	if incarnationChanged {
+		ctx := ctrl.LoggerInto(context.Background(), log)
+		if err := r.ensureClusterQueueCaches(ctx, e.ObjectNew); err != nil {
+			log.Error(err, "Failed to replace ClusterQueue caches")
+		}
+	} else {
+		if err := r.cache.UpdateClusterQueue(log, e.ObjectNew); err != nil {
+			log.Error(err, "Failed to update clusterQueue in cache")
+		}
+		if err := r.qManager.UpdateClusterQueue(context.Background(), e.ObjectNew, specUpdated); err != nil {
+			log.Error(err, "Failed to update clusterQueue in queue manager")
+		}
 	}
 
 	if e.ObjectOld.Spec.CohortName != e.ObjectNew.Spec.CohortName {

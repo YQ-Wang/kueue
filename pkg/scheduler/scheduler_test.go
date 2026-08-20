@@ -9213,6 +9213,119 @@ func (r *workloadUpdateWatcherRecorder) NotifyWorkloadUpdate(oldWl, newWl *kueue
 	}
 }
 
+func TestRequeueHeadFromStaleClusterQueueIncarnation(t *testing.T) {
+	ctx, log := utiltesting.ContextWithLog(t)
+	newCQ := utiltestingapi.MakeClusterQueue("cq").
+		ResourceGroup(*utiltestingapi.MakeFlavorQuotas("default").Resource(corev1.ResourceCPU, "10").Obj()).
+		Active(metav1.ConditionTrue).
+		Obj()
+	newCQ.UID = "new"
+	oldCQ := newCQ.DeepCopy()
+	oldCQ.UID = "old"
+	lq := utiltestingapi.MakeLocalQueue("lq", "ns").ClusterQueue(newCQ.Name).Obj()
+	wl := utiltestingapi.MakeWorkload("wl", lq.Namespace).Queue(kueue.LocalQueueName(lq.Name)).Obj()
+	cl := utiltesting.NewClientBuilder().WithObjects(newCQ, lq, wl).Build()
+
+	cqCache := schdcache.New(cl)
+	cqCache.AddOrUpdateResourceFlavor(log, utiltestingapi.MakeResourceFlavor("default").Obj())
+	if err := cqCache.AddClusterQueue(ctx, newCQ); err != nil {
+		t.Fatalf("Adding replacement ClusterQueue to scheduler cache: %v", err)
+	}
+	qManager := qcache.NewManagerForUnitTests(cl, cqCache)
+	if err := qManager.AddClusterQueue(ctx, oldCQ); err != nil {
+		t.Fatalf("Adding old ClusterQueue to queue manager: %v", err)
+	}
+	if err := qManager.AddLocalQueue(ctx, lq); err != nil {
+		t.Fatalf("Adding LocalQueue: %v", err)
+	}
+	heads := qManager.Heads(ctx)
+	if len(heads) != 1 {
+		t.Fatalf("Heads() returned %d workloads, want 1", len(heads))
+	}
+	if heads[0].ClusterQueueUID != oldCQ.UID {
+		t.Fatalf("Head ClusterQueueUID = %q, want %q", heads[0].ClusterQueueUID, oldCQ.UID)
+	}
+	heads[0].LastAssignment = &workload.AssignmentClusterQueueState{ClusterQueueGeneration: 10}
+	snapshot, err := cqCache.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Taking scheduler cache snapshot: %v", err)
+	}
+	scheduler := &Scheduler{queues: qManager}
+
+	current := scheduler.requeueHeadsFromStaleClusterQueueIncarnations(ctx, heads, snapshot)
+	if len(current) != 0 {
+		t.Fatalf("Current heads = %v, want stale head to be requeued", current)
+	}
+	requeued := qManager.PendingWorkloadsInfo(kueue.ClusterQueueReference(oldCQ.Name))
+	if len(requeued) != 1 {
+		t.Fatalf("PendingWorkloadsInfo() after requeue returned %d workloads, want 1", len(requeued))
+	}
+	if requeued[0].LastAssignment != nil {
+		t.Fatalf("Requeued workload retained LastAssignment: %+v", requeued[0].LastAssignment)
+	}
+}
+
+func TestRequeueSecondPassHeadFromStaleClusterQueueIncarnation(t *testing.T) {
+	now := time.Now()
+	fakeClock := testingclock.NewFakeClock(now)
+	newCQ := utiltestingapi.MakeClusterQueue("cq").
+		ResourceGroup(*utiltestingapi.MakeFlavorQuotas("default").Resource(corev1.ResourceCPU, "10").Obj()).
+		Active(metav1.ConditionTrue).
+		Obj()
+	newCQ.UID = "new"
+	oldCQ := newCQ.DeepCopy()
+	oldCQ.UID = "old"
+	lq := utiltestingapi.MakeLocalQueue("lq", "ns").ClusterQueue(newCQ.Name).Obj()
+	wl := utiltestingapi.MakeWorkload("wl", lq.Namespace).
+		Queue(kueue.LocalQueueName(lq.Name)).
+		PodSets(*utiltestingapi.MakePodSet("one", 1).
+			RequiredTopologyRequest(corev1.LabelHostname).
+			Request(corev1.ResourceCPU, "1").
+			Obj()).
+		ReserveQuotaAt(
+			utiltestingapi.MakeAdmission(kueue.ClusterQueueReference(newCQ.Name)).
+				PodSets(utiltestingapi.MakePodSetAssignment("one").
+					Assignment(corev1.ResourceCPU, "default", "1").
+					DelayedTopologyRequest(kueue.DelayedTopologyRequestStatePending).
+					Obj()).
+				Obj(),
+			now).
+		AdmissionCheck(kueue.AdmissionCheckState{Name: "prov-check", State: kueue.CheckStateReady}).
+		Obj()
+	if !workload.NeedsSecondPass(wl) {
+		t.Fatal("Test workload does not require a second pass")
+	}
+	cl := utiltesting.NewClientBuilder().WithObjects(newCQ, lq, wl).Build()
+	ctx, log := utiltesting.ContextWithLog(t)
+	cqCache := schdcache.New(cl)
+	cqCache.AddOrUpdateResourceFlavor(log, utiltestingapi.MakeResourceFlavor("default").Obj())
+	if err := cqCache.AddClusterQueue(ctx, newCQ); err != nil {
+		t.Fatalf("Adding replacement ClusterQueue to scheduler cache: %v", err)
+	}
+	qManager := qcache.NewManagerForUnitTests(cl, cqCache, qcache.WithClock(fakeClock))
+	if err := qManager.AddClusterQueue(ctx, oldCQ); err != nil {
+		t.Fatalf("Adding old ClusterQueue to queue manager: %v", err)
+	}
+	snapshot, err := cqCache.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Taking scheduler cache snapshot: %v", err)
+	}
+	info := workload.NewInfo(wl)
+	info.SecondPassIteration = 1
+	heads := []qcache.Head{{Info: *info, ClusterQueueUID: oldCQ.UID}}
+	scheduler := &Scheduler{queues: qManager}
+
+	current := scheduler.requeueHeadsFromStaleClusterQueueIncarnations(ctx, heads, snapshot)
+	if len(current) != 0 {
+		t.Fatalf("Current heads = %v, want stale second-pass head to be requeued", current)
+	}
+	fakeClock.Step(30 * time.Second)
+	requeued := qManager.Heads(ctx)
+	if len(requeued) != 1 || workload.Key(requeued[0].Obj) != workload.Key(wl) {
+		t.Fatalf("Requeued second-pass heads = %v, want workload %s", requeued, workload.Key(wl))
+	}
+}
+
 func TestLastAssignmentOutdated(t *testing.T) {
 	type args struct {
 		currentSchedulingCycle int64

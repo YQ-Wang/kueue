@@ -63,8 +63,9 @@ const (
 )
 
 const (
-	StoppedReason                = "Stopped"
-	clusterQueueIsInactiveReason = "ClusterQueueIsInactive"
+	StoppedReason                  = "Stopped"
+	clusterQueueIsInactiveReason   = "ClusterQueueIsInactive"
+	clusterQueueDoesNotExistReason = "ClusterQueueDoesNotExist"
 )
 
 type LocalQueueReconcilerOptions struct {
@@ -191,24 +192,58 @@ func (r *LocalQueueReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		)
 	}
 
-	if ptr.Deref(queueObj.Spec.StopPolicy, kueue.None) != kueue.None {
-		err := r.UpdateStatusIfChanged(ctx, &queueObj, metav1.ConditionFalse, StoppedReason, localQueueIsInactiveMsg)
-		return ctrl.Result{}, client.IgnoreNotFound(err)
-	}
-
+	stopped := ptr.Deref(queueObj.Spec.StopPolicy, kueue.None) != kueue.None
+	stats, usageErr := r.cache.LocalQueueUsage(&queueObj)
 	var cq kueue.ClusterQueue
 	if err := r.client.Get(ctx, client.ObjectKey{Name: string(queueObj.Spec.ClusterQueue)}, &cq); err != nil {
 		if apierrors.IsNotFound(err) {
-			err = r.updateStatusIfChanged(ctx, &queueObj, &schdcache.LocalQueueUsageStats{}, metav1.ConditionFalse, "ClusterQueueDoesNotExist", clusterQueueIsInactiveMsg)
+			if stats.ClusterQueueExists {
+				if stopped {
+					if statusErr := r.applyLocalQueueCondition(ctx, &queueObj, metav1.ConditionFalse, StoppedReason, localQueueIsInactiveMsg); statusErr != nil {
+						return ctrl.Result{}, client.IgnoreNotFound(statusErr)
+					}
+				}
+				log.V(2).Info("ClusterQueue is absent from the API but still present in the scheduler cache; waiting for cleanup",
+					"clusterQueue", queueObj.Spec.ClusterQueue, "cacheReadError", usageErr)
+				return ctrl.Result{RequeueAfter: constants.UpdatesBatchPeriod}, nil
+			}
+			if usageErr != nil {
+				return ctrl.Result{}, usageErr
+			}
+			if stopped {
+				err = r.applyLocalQueueStatus(ctx, &queueObj, stats, metav1.ConditionFalse, StoppedReason, localQueueIsInactiveMsg)
+			} else {
+				err = r.applyLocalQueueStatus(ctx, &queueObj, stats, metav1.ConditionFalse, clusterQueueDoesNotExistReason, clusterQueueIsInactiveMsg)
+			}
 		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
+
+	if !stats.ClusterQueueExists || stats.ClusterQueueUID != cq.UID {
+		if stopped {
+			if err := r.applyLocalQueueCondition(ctx, &queueObj, metav1.ConditionFalse, StoppedReason, localQueueIsInactiveMsg); err != nil {
+				return ctrl.Result{}, client.IgnoreNotFound(err)
+			}
+		}
+		log.V(2).Info("ClusterQueue API object and scheduler cache describe different incarnations; waiting for synchronization",
+			"clusterQueue", cq.Name, "apiUID", cq.UID, "cacheUID", stats.ClusterQueueUID, "cacheReadError", usageErr)
+		return ctrl.Result{RequeueAfter: constants.UpdatesBatchPeriod}, nil
+	}
+	if usageErr != nil {
+		return ctrl.Result{}, usageErr
+	}
+
+	if stopped {
+		err := r.applyLocalQueueStatus(ctx, &queueObj, stats, metav1.ConditionFalse, StoppedReason, localQueueIsInactiveMsg)
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
 	if meta.IsStatusConditionTrue(cq.Status.Conditions, kueue.ClusterQueueActive) {
-		if err := r.UpdateStatusIfChanged(ctx, &queueObj, metav1.ConditionTrue, "Ready", "Can submit new workloads to localQueue"); err != nil {
+		if err := r.applyLocalQueueStatus(ctx, &queueObj, stats, metav1.ConditionTrue, "Ready", "Can submit new workloads to localQueue"); err != nil {
 			return ctrl.Result{}, client.IgnoreNotFound(err)
 		}
 	} else {
-		err := r.UpdateStatusIfChanged(ctx, &queueObj, metav1.ConditionFalse, clusterQueueIsInactiveReason, clusterQueueIsInactiveMsg)
+		err := r.applyLocalQueueStatus(ctx, &queueObj, stats, metav1.ConditionFalse, clusterQueueIsInactiveReason, clusterQueueIsInactiveMsg)
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
@@ -583,9 +618,9 @@ func (h *qCQHandler) Update(ctx context.Context, e event.UpdateEvent, wq workque
 	if !ok {
 		return
 	}
-	// Iff .status.conditions of the clusterQueue is updated,
-	// this handler sends all queues related to the clusterQueue to workqueue.
-	if equality.Semantic.DeepEqual(oldCq.Status.Conditions, newCq.Status.Conditions) {
+	// Reconcile on condition changes and on same-name replacements, which an
+	// informer may deliver as an Update with different UIDs.
+	if oldCq.UID == newCq.UID && equality.Semantic.DeepEqual(oldCq.Status.Conditions, newCq.Status.Conditions) {
 		return
 	}
 	h.addLocalQueueToWorkQueue(ctx, newCq, wq)
@@ -640,19 +675,10 @@ func (r *LocalQueueReconciler) SetupWithManager(mgr ctrl.Manager, cfg *config.Co
 		Complete(WithLeadingManager(mgr, r, &kueue.LocalQueue{}, cfg))
 }
 
-func (r *LocalQueueReconciler) UpdateStatusIfChanged(
+func (r *LocalQueueReconciler) applyLocalQueueStatus(
 	ctx context.Context,
 	queue *kueue.LocalQueue,
-	conditionStatus metav1.ConditionStatus,
-	reason, msg string,
-) error {
-	return r.updateStatusIfChanged(ctx, queue, nil, conditionStatus, reason, msg)
-}
-
-func (r *LocalQueueReconciler) updateStatusIfChanged(
-	ctx context.Context,
-	queue *kueue.LocalQueue,
-	usage *schdcache.LocalQueueUsageStats,
+	stats *schdcache.LocalQueueUsageStats,
 	conditionStatus metav1.ConditionStatus,
 	reason, msg string,
 ) error {
@@ -669,36 +695,50 @@ func (r *LocalQueueReconciler) updateStatusIfChanged(
 			return err
 		}
 	}
-	stats := usage
-	if stats == nil {
-		stats, err = r.cache.LocalQueueUsage(queue)
-		if err != nil {
-			log.Error(err, failedUpdateLqStatusMsg)
-			return err
-		}
-	}
 	queue.Status.PendingWorkloads = pendingWls
 	queue.Status.ReservingWorkloads = int32(stats.ReservingWorkloads)
 	queue.Status.AdmittedWorkloads = int32(stats.AdmittedWorkloads)
 	queue.Status.FlavorsReservation = stats.ReservedResources
 	queue.Status.FlavorsUsage = stats.AdmittedResources
 	if len(conditionStatus) != 0 && len(reason) != 0 && len(msg) != 0 {
-		meta.SetStatusCondition(&queue.Status.Conditions, metav1.Condition{
-			Type:               kueue.LocalQueueActive,
-			Status:             conditionStatus,
-			Reason:             reason,
-			Message:            msg,
-			ObservedGeneration: queue.Generation,
-		})
-		if r.lqMetrics.ShouldExposeLocalQueueMetrics(queue.GetLabels()) {
-			metrics.ReportLocalQueueStatus(metrics.LocalQueueReference{
-				Name:      kueue.LocalQueueName(queue.Name),
-				Namespace: queue.Namespace,
-			}, conditionStatus, r.customLabels.LQGet(utilqueue.Key(queue)), r.roleTracker)
-		}
+		r.setLocalQueueCondition(queue, conditionStatus, reason, msg)
 	}
 	if !equality.Semantic.DeepEqual(oldStatus, queue.Status) {
 		return r.client.Status().Update(ctx, queue)
 	}
 	return nil
+}
+
+func (r *LocalQueueReconciler) applyLocalQueueCondition(
+	ctx context.Context,
+	queue *kueue.LocalQueue,
+	conditionStatus metav1.ConditionStatus,
+	reason, msg string,
+) error {
+	oldStatus := queue.Status.DeepCopy()
+	r.setLocalQueueCondition(queue, conditionStatus, reason, msg)
+	if !equality.Semantic.DeepEqual(oldStatus, queue.Status) {
+		return r.client.Status().Update(ctx, queue)
+	}
+	return nil
+}
+
+func (r *LocalQueueReconciler) setLocalQueueCondition(
+	queue *kueue.LocalQueue,
+	conditionStatus metav1.ConditionStatus,
+	reason, msg string,
+) {
+	meta.SetStatusCondition(&queue.Status.Conditions, metav1.Condition{
+		Type:               kueue.LocalQueueActive,
+		Status:             conditionStatus,
+		Reason:             reason,
+		Message:            msg,
+		ObservedGeneration: queue.Generation,
+	})
+	if r.lqMetrics.ShouldExposeLocalQueueMetrics(queue.GetLabels()) {
+		metrics.ReportLocalQueueStatus(metrics.LocalQueueReference{
+			Name:      kueue.LocalQueueName(queue.Name),
+			Namespace: queue.Namespace,
+		}, conditionStatus, r.customLabels.LQGet(utilqueue.Key(queue)), r.roleTracker)
+	}
 }

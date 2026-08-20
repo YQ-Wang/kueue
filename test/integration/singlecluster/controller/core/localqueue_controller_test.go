@@ -183,6 +183,43 @@ var _ = ginkgo.Describe("Queue controller", ginkgo.Label("controller:localqueue"
 		}, util.Timeout, util.Interval).Should(gomega.Succeed())
 	})
 
+	ginkgo.It("Should recover after a ClusterQueue is recreated with the same name", framework.SlowSpec, func() {
+		ginkgo.By("Creating resourceFlavors")
+		for _, rf := range resourceFlavors {
+			util.MustCreate(ctx, k8sClient, &rf)
+		}
+		ginkgo.By("Creating and activating the original ClusterQueue")
+		util.MustCreate(ctx, k8sClient, clusterQueue)
+		util.ExpectClusterQueuesToBeActive(ctx, k8sClient, clusterQueue)
+		oldUID := clusterQueue.UID
+
+		ginkgo.By("Deleting and recreating the ClusterQueue under the same name")
+		replacement := clusterQueue.DeepCopy()
+		replacement.ObjectMeta = metav1.ObjectMeta{Name: clusterQueue.Name}
+		replacement.Status = kueue.ClusterQueueStatus{}
+		util.ExpectObjectToBeDeleted(ctx, k8sClient, clusterQueue, true)
+		util.MustCreate(ctx, k8sClient, replacement)
+		gomega.Expect(replacement.UID).NotTo(gomega.Equal(oldUID))
+		clusterQueue = replacement
+		util.ExpectClusterQueuesToBeActive(ctx, k8sClient, replacement)
+
+		ginkgo.By("Waiting for the LocalQueue status to use the replacement incarnation")
+		gomega.Eventually(func(g gomega.Gomega) {
+			var updatedQueue kueue.LocalQueue
+			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(queue), &updatedQueue)).To(gomega.Succeed())
+			g.Expect(updatedQueue.Status).Should(gomega.BeComparableTo(kueue.LocalQueueStatus{
+				Conditions: []metav1.Condition{{
+					Type:    kueue.LocalQueueActive,
+					Status:  metav1.ConditionTrue,
+					Reason:  "Ready",
+					Message: "Can submit new workloads to localQueue",
+				}},
+				FlavorsReservation: emptyUsage,
+				FlavorsUsage:       emptyUsage,
+			}, util.IgnoreConditionTimestampsAndObservedGeneration))
+		}, util.Timeout, util.Interval).Should(gomega.Succeed())
+	})
+
 	ginkgo.It("Should update status when workloads are created", framework.SlowSpec, func() {
 		ginkgo.By("Creating resourceFlavors")
 		for _, rf := range resourceFlavors {

@@ -19,6 +19,7 @@ package queue
 import (
 	"cmp"
 	"context"
+	"fmt"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -29,6 +30,7 @@ import (
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
@@ -63,6 +65,7 @@ const (
 	RequeueReasonPreemptionFailed       RequeueReason = "PreemptionFailed"
 	RequeueReasonNoFit                  RequeueReason = "NoFit"
 	RequeueReasonPreemptionNoCandidates RequeueReason = "PreemptionNoCandidates"
+	RequeueReasonClusterQueueChanged    RequeueReason = "ClusterQueueChanged"
 )
 
 // QuotaReservedReason represents the reason for the WorkloadQuotaReserved condition
@@ -162,6 +165,7 @@ func logStickyWorkloadSelectionIfVerbose(log logr.Logger, wl *kueue.Workload) {
 type ClusterQueue struct {
 	hierarchy.ClusterQueue[*cohort]
 	name              kueue.ClusterQueueReference
+	uid               types.UID
 	namespaceSelector labels.Selector
 	active            bool
 	workloads         *PendingWorkloads
@@ -264,6 +268,7 @@ func newClusterQueue(
 		withEnableAdmissionFs(enableAdmissionFs),
 		withAfsUsageLedger(afsUsageLedger),
 	)
+	cqImpl.uid = cq.UID
 	err := cqImpl.Update(cq)
 	if err != nil {
 		return nil, err
@@ -325,6 +330,9 @@ func newClusterQueueImpl(ctx context.Context, client client.Client, cl *metrics.
 func (c *ClusterQueue) Update(apiCQ *kueue.ClusterQueue) error {
 	c.rwm.Lock()
 	defer c.rwm.Unlock()
+	if c.uid != apiCQ.UID {
+		return fmt.Errorf("%w: cached %q, observed %q", ErrClusterQueueUIDMismatch, c.uid, apiCQ.UID)
+	}
 	c.name = kueue.ClusterQueueReference(apiCQ.Name)
 	c.queueingStrategy = apiCQ.Spec.QueueingStrategy
 	nsSelector, err := metav1.LabelSelectorAsSelector(apiCQ.Spec.NamespaceSelector)
@@ -832,7 +840,8 @@ func (c *ClusterQueue) RequeueIfNotPresent(ctx context.Context, wInfo *workload.
 		immediate = reason == RequeueReasonFailedAfterNomination ||
 			reason == RequeueReasonPendingPreemption ||
 			reason == RequeueReasonPendingMigration ||
-			reason == RequeueReasonPreemptionFailed
+			reason == RequeueReasonPreemptionFailed ||
+			reason == RequeueReasonClusterQueueChanged
 	}
 	return c.requeueIfNotPresent(log, wInfo, immediate, reason, quotaReservedReason)
 }

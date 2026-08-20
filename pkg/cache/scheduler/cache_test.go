@@ -35,6 +35,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	configapi "sigs.k8s.io/kueue/apis/config/v1beta2"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
@@ -1942,6 +1943,7 @@ func TestLocalQueueUsage(t *testing.T) {
 				Obj(),
 		).
 		Obj()
+	cq.UID = "foo-uid"
 	localQueue := *utiltestingapi.MakeLocalQueue("test", "ns1").
 		ClusterQueue("foo").Obj()
 	cases := map[string]struct {
@@ -2141,10 +2143,242 @@ func TestLocalQueueUsage(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Couldn't get usage for the queue: %v", err)
 			}
+			if wantExists := tc.cq != nil; gotUsage.ClusterQueueExists != wantExists {
+				t.Errorf("ClusterQueueExists = %t, want %t", gotUsage.ClusterQueueExists, wantExists)
+			}
+			if tc.cq != nil && gotUsage.ClusterQueueUID != tc.cq.UID {
+				t.Errorf("ClusterQueueUID = %q, want %q", gotUsage.ClusterQueueUID, tc.cq.UID)
+			}
 			if diff := cmp.Diff(tc.wantUsage, gotUsage.ReservedResources); diff != "" {
 				t.Errorf("Unexpected used resources for the queue (-want,+got):\n%s", diff)
 			}
 		})
+	}
+}
+
+func TestEnsureClusterQueueReplacesIncarnation(t *testing.T) {
+	now := time.Now()
+	oldCQ := utiltestingapi.MakeClusterQueue("cq").
+		ResourceGroup(*utiltestingapi.MakeFlavorQuotas("default").Resource(corev1.ResourceCPU, "10").Obj()).
+		Obj()
+	oldCQ.UID = "old"
+	newCQ := oldCQ.DeepCopy()
+	newCQ.UID = "new"
+	lq := utiltestingapi.MakeLocalQueue("lq", "ns").ClusterQueue(oldCQ.Name).Obj()
+
+	cl := utiltesting.NewClientBuilder().WithObjects(newCQ, lq).Build()
+	cache := New(cl)
+	ctx, log := utiltesting.ContextWithLog(t)
+	if err := cache.AddClusterQueue(ctx, oldCQ); err != nil {
+		t.Fatalf("Adding old ClusterQueue: %v", err)
+	}
+	oldWorkload := utiltestingapi.MakeWorkload("wl", lq.Namespace).
+		Queue(kueue.LocalQueueName(lq.Name)).
+		Request(corev1.ResourceCPU, "4").
+		SimpleReserveQuota(kueue.ClusterQueueReference(oldCQ.Name), "default", now).
+		AdmittedAt(true, now).
+		Obj()
+	if !cache.AddOrUpdateWorkload(log, oldWorkload) {
+		t.Fatal("Old workload was not added")
+	}
+
+	if err := cache.UpdateClusterQueue(log, newCQ); !errors.Is(err, ErrCqUIDMismatch) {
+		t.Fatalf("UpdateClusterQueue() error = %v, want %v", err, ErrCqUIDMismatch)
+	}
+	if err := cache.EnsureClusterQueue(ctx, oldCQ); err != nil {
+		t.Fatalf("Ensuring same incarnation: %v", err)
+	}
+	before, err := cache.LocalQueueUsage(lq)
+	if err != nil {
+		t.Fatalf("Reading usage before replacement: %v", err)
+	}
+	if before.ClusterQueueUID != oldCQ.UID || before.AdmittedWorkloads != 1 {
+		t.Fatalf("Usage before replacement = %+v, want old UID with one admitted workload", before)
+	}
+
+	if err := cache.EnsureClusterQueue(ctx, newCQ); err != nil {
+		t.Fatalf("Replacing ClusterQueue: %v", err)
+	}
+	after, err := cache.LocalQueueUsage(lq)
+	if err != nil {
+		t.Fatalf("Reading usage after replacement: %v", err)
+	}
+	if after.ClusterQueueUID != newCQ.UID || !after.ClusterQueueExists {
+		t.Fatalf("Usage after replacement = %+v, want new UID", after)
+	}
+	if after.AdmittedWorkloads != 0 || len(after.AdmittedResources) == 0 || !after.AdmittedResources[0].Resources[0].Total.IsZero() {
+		t.Fatalf("Usage after replacement = %+v, want zero rebuilt usage", after)
+	}
+
+	cache.DeleteClusterQueue(oldCQ)
+	afterStaleDelete, err := cache.LocalQueueUsage(lq)
+	if err != nil {
+		t.Fatalf("Reading usage after stale delete: %v", err)
+	}
+	if !afterStaleDelete.ClusterQueueExists || afterStaleDelete.ClusterQueueUID != newCQ.UID {
+		t.Fatalf("Stale delete removed replacement: %+v", afterStaleDelete)
+	}
+}
+
+func TestEnsureClusterQueueRetriesAfterListFailure(t *testing.T) {
+	oldCQ := utiltestingapi.MakeClusterQueue("cq").Obj()
+	oldCQ.UID = "old"
+	newCQ := oldCQ.DeepCopy()
+	newCQ.UID = "new"
+	lq := utiltestingapi.MakeLocalQueue("lq", "ns").ClusterQueue(oldCQ.Name).Obj()
+	failList := false
+	cl := utiltesting.NewClientBuilder().
+		WithObjects(newCQ, lq).
+		WithInterceptorFuncs(interceptor.Funcs{
+			List: func(ctx context.Context, cl client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+				if failList {
+					if _, ok := list.(*kueue.LocalQueueList); ok {
+						return errors.New("injected LocalQueue list failure")
+					}
+				}
+				return cl.List(ctx, list, opts...)
+			},
+		}).
+		Build()
+	cache := New(cl)
+	ctx, _ := utiltesting.ContextWithLog(t)
+	if err := cache.AddClusterQueue(ctx, oldCQ); err != nil {
+		t.Fatalf("Adding old ClusterQueue: %v", err)
+	}
+
+	failList = true
+	if err := cache.EnsureClusterQueue(ctx, newCQ); err == nil {
+		t.Fatal("EnsureClusterQueue() succeeded, want injected list failure")
+	}
+	if got := cache.hm.ClusterQueue(kueue.ClusterQueueReference(newCQ.Name)); got != nil {
+		t.Fatalf("Partial replacement remained after failure: %#v", got)
+	}
+
+	failList = false
+	if err := cache.EnsureClusterQueue(ctx, newCQ); err != nil {
+		t.Fatalf("Retrying replacement: %v", err)
+	}
+	usage, err := cache.LocalQueueUsage(lq)
+	if err != nil {
+		t.Fatalf("Reading LocalQueue usage: %v", err)
+	}
+	if !usage.ClusterQueueExists || usage.ClusterQueueUID != newCQ.UID {
+		t.Fatalf("Replacement after retry = %+v, want UID %q", usage, newCQ.UID)
+	}
+}
+
+func TestEnsureClusterQueueReplacementAdoptsAPIWorkloads(t *testing.T) {
+	now := time.Now()
+	oldCQ := utiltestingapi.MakeClusterQueue("cq").
+		ResourceGroup(*utiltestingapi.MakeFlavorQuotas("default").Resource(corev1.ResourceCPU, "10").Obj()).
+		Obj()
+	oldCQ.UID = "old"
+	newCQ := oldCQ.DeepCopy()
+	newCQ.UID = "new"
+	lq := utiltestingapi.MakeLocalQueue("lq", "ns").ClusterQueue(oldCQ.Name).Obj()
+	wl := utiltestingapi.MakeWorkload("wl", lq.Namespace).
+		Queue(kueue.LocalQueueName(lq.Name)).
+		Request(corev1.ResourceCPU, "4").
+		SimpleReserveQuota(kueue.ClusterQueueReference(oldCQ.Name), "default", now).
+		AdmittedAt(true, now).
+		Obj()
+	cl := utiltesting.NewClientBuilder().WithObjects(newCQ, lq, wl).Build()
+	cache := New(cl)
+	ctx, _ := utiltesting.ContextWithLog(t)
+	if err := cache.AddClusterQueue(ctx, oldCQ); err != nil {
+		t.Fatalf("Adding old ClusterQueue: %v", err)
+	}
+
+	if err := cache.EnsureClusterQueue(ctx, newCQ); err != nil {
+		t.Fatalf("Replacing ClusterQueue: %v", err)
+	}
+	usage, err := cache.LocalQueueUsage(lq)
+	if err != nil {
+		t.Fatalf("Reading LocalQueue usage: %v", err)
+	}
+	if usage.ClusterQueueUID != newCQ.UID || usage.AdmittedWorkloads != 1 {
+		t.Fatalf("Rebuilt usage = %+v, want new UID with one API-resident workload", usage)
+	}
+}
+
+func TestEnsureClusterQueueWaitsForPendingAssumption(t *testing.T) {
+	now := time.Now()
+	oldCQ := utiltestingapi.MakeClusterQueue("cq").
+		ResourceGroup(*utiltestingapi.MakeFlavorQuotas("default").Resource(corev1.ResourceCPU, "10").Obj()).
+		Obj()
+	oldCQ.UID = "old"
+	newCQ := oldCQ.DeepCopy()
+	newCQ.UID = "new"
+	lq := utiltestingapi.MakeLocalQueue("lq", "ns").ClusterQueue(oldCQ.Name).Obj()
+	apiWorkload := utiltestingapi.MakeWorkload("wl", lq.Namespace).
+		Queue(kueue.LocalQueueName(lq.Name)).
+		Request(corev1.ResourceCPU, "4").
+		Obj()
+	assumedWorkload := utiltestingapi.MakeWorkload(apiWorkload.Name, apiWorkload.Namespace).
+		Queue(kueue.LocalQueueName(lq.Name)).
+		Request(corev1.ResourceCPU, "4").
+		SimpleReserveQuota(kueue.ClusterQueueReference(oldCQ.Name), "default", now).
+		Obj()
+	cl := utiltesting.NewClientBuilder().WithObjects(newCQ, lq, apiWorkload).Build()
+	cache := New(cl)
+	ctx, log := utiltesting.ContextWithLog(t)
+	if err := cache.AddClusterQueue(ctx, oldCQ); err != nil {
+		t.Fatalf("Adding old ClusterQueue: %v", err)
+	}
+	if _, err := cache.AddOrUpdateWorkloadForClusterQueueUID(log, assumedWorkload, newCQ.UID); !errors.Is(err, ErrCqUIDMismatch) {
+		t.Fatalf("Adding assumption with replacement UID error = %v, want %v", err, ErrCqUIDMismatch)
+	}
+	if !cache.AddOrUpdateWorkload(log, assumedWorkload) {
+		t.Fatal("Adding assumed workload")
+	}
+
+	if err := cache.EnsureClusterQueue(ctx, newCQ); !errors.Is(err, ErrCqAssumptions) {
+		t.Fatalf("EnsureClusterQueue() error = %v, want %v", err, ErrCqAssumptions)
+	}
+	usage, err := cache.LocalQueueUsage(lq)
+	if err != nil {
+		t.Fatalf("Reading LocalQueue usage: %v", err)
+	}
+	if usage.ClusterQueueUID != oldCQ.UID || usage.ReservingWorkloads != 1 {
+		t.Fatalf("Old incarnation was replaced while an assumption was pending: %+v", usage)
+	}
+
+	if err := cache.DeleteWorkload(log, workload.Key(assumedWorkload)); err != nil {
+		t.Fatalf("Deleting failed assumption: %v", err)
+	}
+	if err := cache.EnsureClusterQueue(ctx, newCQ); err != nil {
+		t.Fatalf("Replacing after assumption cleanup: %v", err)
+	}
+}
+
+func TestAddOrUpdateWorkloadForClusterQueueUIDRejectsTerminating(t *testing.T) {
+	now := time.Now()
+	cq := utiltestingapi.MakeClusterQueue("cq").
+		ResourceGroup(*utiltestingapi.MakeFlavorQuotas("default").Resource(corev1.ResourceCPU, "10").Obj()).
+		Obj()
+	cq.UID = "uid"
+	lq := utiltestingapi.MakeLocalQueue("lq", "ns").ClusterQueue(cq.Name).Obj()
+	assumedWorkload := utiltestingapi.MakeWorkload("wl", lq.Namespace).
+		Queue(kueue.LocalQueueName(lq.Name)).
+		Request(corev1.ResourceCPU, "4").
+		SimpleReserveQuota(kueue.ClusterQueueReference(cq.Name), "default", now).
+		Obj()
+	cl := utiltesting.NewClientBuilder().WithObjects(cq, lq).Build()
+	cache := New(cl)
+	ctx, log := utiltesting.ContextWithLog(t)
+	cache.AddOrUpdateResourceFlavor(log, utiltestingapi.MakeResourceFlavor("default").Obj())
+	if err := cache.AddClusterQueue(ctx, cq); err != nil {
+		t.Fatalf("Adding ClusterQueue: %v", err)
+	}
+	deletingCQ := cq.DeepCopy()
+	deletionTime := metav1.NewTime(now)
+	deletingCQ.DeletionTimestamp = &deletionTime
+	if err := cache.EnsureClusterQueue(ctx, deletingCQ); err != nil {
+		t.Fatalf("Ensuring deleting ClusterQueue: %v", err)
+	}
+
+	if _, err := cache.AddOrUpdateWorkloadForClusterQueueUID(log, assumedWorkload, cq.UID); !errors.Is(err, ErrCqNotActive) {
+		t.Fatalf("Adding assumption to terminating ClusterQueue error = %v, want %v", err, ErrCqNotActive)
 	}
 }
 

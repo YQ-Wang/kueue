@@ -338,6 +338,10 @@ func (s *Scheduler) schedule(ctx context.Context) wait.SpeedSignal {
 	}
 	logSnapshotIfVerbose(log, snapshot)
 	log.V(2).Info("Snapshot taken", "duration", s.clock.Since(phaseStartTime))
+	heads = s.requeueHeadsFromStaleClusterQueueIncarnations(ctx, heads, snapshot)
+	if len(heads) == 0 {
+		return wait.KeepGoing
+	}
 
 	// 3. Calculate requirements (resource flavors, borrowing) for admitting workloads.
 	phaseStartTime = s.clock.Now()
@@ -383,6 +387,29 @@ func (s *Scheduler) schedule(ctx context.Context) wait.SpeedSignal {
 		return wait.SlowDown
 	}
 	return wait.KeepGoing
+}
+
+func (s *Scheduler) requeueHeadsFromStaleClusterQueueIncarnations(ctx context.Context, heads []qcache.Head, snapshot *schdcache.Snapshot) []qcache.Head {
+	current := heads[:0]
+	for i := range heads {
+		cq := snapshot.ClusterQueue(heads[i].ClusterQueue)
+		if cq == nil || cq.UID == heads[i].ClusterQueueUID {
+			current = append(current, heads[i])
+			continue
+		}
+
+		ctrl.LoggerFrom(ctx).V(2).Info("Requeuing workload because its ClusterQueue incarnation changed during the scheduling cycle",
+			"workload", klog.KObj(heads[i].Obj),
+			"clusterQueue", heads[i].ClusterQueue,
+			"queueManagerUID", heads[i].ClusterQueueUID,
+			"schedulerCacheUID", cq.UID)
+		heads[i].LastAssignment = nil
+		if s.queues.QueueSecondPassIfNeeded(ctx, heads[i].Obj, heads[i].SecondPassIteration) {
+			continue
+		}
+		s.queues.RequeueWorkload(ctx, &heads[i].Info, qcache.RequeueReasonClusterQueueChanged, "")
+	}
+	return current
 }
 
 // processEntry runs the admission pipeline for a single entry: TAS replacement,
@@ -1055,7 +1082,14 @@ func (s *Scheduler) prepareWorkload(log logr.Logger, wl *kueue.Workload, cq *sch
 func (s *Scheduler) assumeWorkload(log logr.Logger, e *entry, cq *schdcache.ClusterQueueSnapshot, admission *kueue.Admission) (*kueue.Workload, error) {
 	cacheWl := e.Obj.DeepCopy()
 	s.prepareWorkload(log, cacheWl, cq, admission)
-	if added := s.cache.AddOrUpdateWorkload(log, cacheWl); !added {
+	added, err := s.cache.AddOrUpdateWorkloadForClusterQueueUID(log, cacheWl, cq.UID)
+	if err != nil {
+		if errors.Is(err, schdcache.ErrCqUIDMismatch) {
+			e.LastAssignment = nil
+		}
+		return nil, fmt.Errorf("adding workload %s/%s to cache: %w", cacheWl.Namespace, cacheWl.Name, err)
+	}
+	if !added {
 		return nil, fmt.Errorf("workload %s/%s could not be added to the cache", cacheWl.Namespace, cacheWl.Name)
 	}
 

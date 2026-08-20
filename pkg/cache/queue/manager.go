@@ -24,6 +24,7 @@ import (
 
 	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 	"k8s.io/utils/clock"
@@ -52,6 +53,7 @@ import (
 var (
 	ErrLocalQueueDoesNotExistOrInactive = errors.New("localQueue doesn't exist or inactive")
 	ErrClusterQueueDoesNotExist         = errors.New("clusterQueue doesn't exist")
+	ErrClusterQueueUIDMismatch          = errors.New("clusterQueue UID does not match cached incarnation")
 	errClusterQueueAlreadyExists        = errors.New("clusterQueue already exists")
 	errWorkloadIsInadmissible           = errors.New("workload is inadmissible and can't be added to a LocalQueue")
 )
@@ -326,7 +328,29 @@ func (m *Manager) AddClusterQueue(ctx context.Context, cq *kueue.ClusterQueue) e
 	if cq := m.hm.ClusterQueue(kueue.ClusterQueueReference(cq.Name)); cq != nil {
 		return errClusterQueueAlreadyExists
 	}
+	return m.addClusterQueueLocked(ctx, cq, false, false)
+}
 
+// EnsureClusterQueue makes sure the queue manager contains the observed
+// ClusterQueue incarnation. A replacement rebuilds queue-local scheduling
+// state and clears flavor scan progress recorded against the old incarnation.
+func (m *Manager) EnsureClusterQueue(ctx context.Context, cq *kueue.ClusterQueue) error {
+	m.Lock()
+	defer m.Unlock()
+
+	cqImpl := m.hm.ClusterQueue(kueue.ClusterQueueReference(cq.Name))
+	if cqImpl == nil {
+		return m.addClusterQueueLocked(ctx, cq, true, true)
+	}
+	if cqImpl.uid == cq.UID {
+		return nil
+	}
+
+	m.deleteClusterQueueLocked(ctrl.LoggerFrom(ctx), cqImpl)
+	return m.addClusterQueueLocked(ctx, cq, true, true)
+}
+
+func (m *Manager) addClusterQueueLocked(ctx context.Context, cq *kueue.ClusterQueue, resetLastAssignment, cleanupOnError bool) (err error) {
 	var afsUsageLedger *queueafs.AfsUsageLedger
 	if afs.Enabled(m.admissionFairSharingConfig) {
 		afsUsageLedger = m.AfsUsageLedger
@@ -337,6 +361,12 @@ func (m *Manager) AddClusterQueue(ctx context.Context, cq *kueue.ClusterQueue) e
 	}
 	m.hm.AddClusterQueue(cqImpl)
 	m.hm.UpdateClusterQueueEdge(kueue.ClusterQueueReference(cq.Name), cq.Spec.CohortName)
+	complete := false
+	defer func() {
+		if cleanupOnError && !complete {
+			m.deleteClusterQueueLocked(ctrl.LoggerFrom(ctx), cqImpl)
+		}
+	}()
 
 	// Iterate through existing queues, as queues corresponding to this cluster
 	// queue might have been added earlier.
@@ -348,6 +378,11 @@ func (m *Manager) AddClusterQueue(ctx context.Context, cq *kueue.ClusterQueue) e
 	for _, q := range queues.Items {
 		qImpl := m.localQueues[queue.Key(&q)]
 		if qImpl != nil {
+			if resetLastAssignment {
+				for _, wInfo := range qImpl.items {
+					wInfo.LastAssignment = nil
+				}
+			}
 			// Seed the cached weight before pushing workloads so the heap
 			// orders them under the correct weight from the first push.
 			cqImpl.addLocalQueue(queue.Key(&q), afs.LQWeightAsFloat64(&q))
@@ -368,6 +403,7 @@ func (m *Manager) AddClusterQueue(ctx context.Context, cq *kueue.ClusterQueue) e
 	if addedWorkloads {
 		m.Broadcast()
 	}
+	complete = true
 	return nil
 }
 
@@ -449,18 +485,31 @@ func (m *Manager) RebuildClusterQueue(log logr.Logger, cq *kueue.ClusterQueue, l
 	if cqImpl == nil {
 		return ErrClusterQueueDoesNotExist
 	}
+	if cqImpl.uid != cq.UID {
+		return ErrClusterQueueUIDMismatch
+	}
 	cqImpl.RebuildHeap(log, lqName)
 	return nil
 }
 
-func (m *Manager) DeleteClusterQueue(log logr.Logger, cq *kueue.ClusterQueue) {
+// DeleteClusterQueue removes the cached ClusterQueue when the UID matches.
+// It returns false only when the name is occupied by a different incarnation.
+func (m *Manager) DeleteClusterQueue(log logr.Logger, cq *kueue.ClusterQueue) bool {
 	m.Lock()
 	defer m.Unlock()
 	cqImpl := m.hm.ClusterQueue(kueue.ClusterQueueReference(cq.Name))
 	if cqImpl == nil {
-		return
+		return true
 	}
-	cqName := kueue.ClusterQueueReference(cq.Name)
+	if cq.UID != "" && cqImpl.uid != cq.UID {
+		return false
+	}
+	m.deleteClusterQueueLocked(log, cqImpl)
+	return true
+}
+
+func (m *Manager) deleteClusterQueueLocked(log logr.Logger, cq *ClusterQueue) {
+	cqName := cq.name
 	m.hm.DeleteClusterQueue(cqName)
 	clearCQMetrics(cqName)
 	if features.Enabled(features.UnadmittedWorkloadsObservability) {
@@ -641,6 +690,9 @@ func (m *Manager) Pending(cq *kueue.ClusterQueue) (int, error) {
 	cqImpl := m.hm.ClusterQueue(kueue.ClusterQueueReference(cq.Name))
 	if cqImpl == nil {
 		return 0, ErrClusterQueueDoesNotExist
+	}
+	if cqImpl.uid != cq.UID {
+		return 0, ErrClusterQueueUIDMismatch
 	}
 
 	return cqImpl.PendingTotal(), nil
@@ -895,7 +947,8 @@ func (m *Manager) CleanUpOnContext(ctx context.Context) {
 // Head represents the head of a queue.
 type Head struct {
 	workload.Info
-	IsPreemptor bool
+	ClusterQueueUID types.UID
+	IsPreemptor     bool
 }
 
 // Heads returns the heads of the queues, along with their associated ClusterQueue.
@@ -921,6 +974,11 @@ func (m *Manager) Heads(ctx context.Context) []Head {
 
 func (m *Manager) heads() []Head {
 	heads := m.secondPassQueue.takeAllReady()
+	for i := range heads {
+		if cq := m.hm.ClusterQueue(heads[i].ClusterQueue); cq != nil {
+			heads[i].ClusterQueueUID = cq.uid
+		}
+	}
 	for cqName, cq := range m.hm.ClusterQueues() {
 		// Cache might be nil in tests, if cache is nil, we'll skip the check.
 		if m.statusChecker != nil && !m.statusChecker.ClusterQueueActive(cqName) {
@@ -935,8 +993,9 @@ func (m *Manager) heads() []Head {
 		wlCopy := *wl
 		wlCopy.ClusterQueue = cqName
 		heads = append(heads, Head{
-			Info:        wlCopy,
-			IsPreemptor: cq.IsPreemptor(wl),
+			Info:            wlCopy,
+			ClusterQueueUID: cq.uid,
+			IsPreemptor:     cq.IsPreemptor(wl),
 		})
 
 		qKey := m.workloadAssignedQueues[wlKey]

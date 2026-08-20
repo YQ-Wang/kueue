@@ -25,11 +25,14 @@ import (
 	"github.com/google/go-cmp/cmp/cmpopts"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	testingclock "k8s.io/utils/clock/testing"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	config "sigs.k8s.io/kueue/apis/config/v1beta2"
@@ -37,6 +40,7 @@ import (
 	qcache "sigs.k8s.io/kueue/pkg/cache/queue"
 	queueafs "sigs.k8s.io/kueue/pkg/cache/queue/afs"
 	schdcache "sigs.k8s.io/kueue/pkg/cache/scheduler"
+	"sigs.k8s.io/kueue/pkg/constants"
 	"sigs.k8s.io/kueue/pkg/features"
 	kueuemetrics "sigs.k8s.io/kueue/pkg/metrics"
 	utilqueue "sigs.k8s.io/kueue/pkg/util/queue"
@@ -159,15 +163,9 @@ func TestLocalQueueReconcile(t *testing.T) {
 			wantLocalQueue: utiltestingapi.MakeLocalQueue("test-queue", "default").
 				ClusterQueue("test-cluster-queue").
 				Generation(1).
-				Condition(
-					kueue.LocalQueueActive,
-					metav1.ConditionFalse,
-					"ClusterQueueDoesNotExist",
-					clusterQueueIsInactiveMsg,
-					1,
-				).
 				Obj(),
-			wantError: nil,
+			wantRequeueAfter: new(constants.UpdatesBatchPeriod),
+			wantError:        nil,
 		},
 		"local queue decaying usage decays if there is no running workloads": {
 			clusterQueue: utiltestingapi.MakeClusterQueue("cq").
@@ -1007,6 +1005,150 @@ func TestLocalQueueReconcile(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestLocalQueueStatusWaitsForClusterQueueIncarnation(t *testing.T) {
+	now := time.Now()
+	makeCQ := func(uid types.UID) *kueue.ClusterQueue {
+		cq := utiltestingapi.MakeClusterQueue("cq").
+			ResourceGroup(*utiltestingapi.MakeFlavorQuotas("default").Resource(corev1.ResourceCPU, "10").Obj()).
+			Obj()
+		cq.UID = uid
+		apimeta.SetStatusCondition(&cq.Status.Conditions, metav1.Condition{
+			Type:    kueue.ClusterQueueActive,
+			Status:  metav1.ConditionTrue,
+			Reason:  "Ready",
+			Message: "Can admit new workloads",
+		})
+		return cq
+	}
+	oldCQ := makeCQ("old")
+	newCQ := makeCQ("new")
+	lq := utiltestingapi.MakeLocalQueue("lq", "ns").ClusterQueue("cq").Obj()
+	objects := []client.Object{newCQ, lq}
+	cl := utiltesting.NewClientBuilder().
+		WithObjects(objects...).
+		WithStatusSubresource(objects...).
+		WithInterceptorFuncs(interceptor.Funcs{SubResourcePatch: utiltesting.TreatSSAAsStrategicMerge}).
+		Build()
+	ctx, log := utiltesting.ContextWithLog(t)
+	cqCache := schdcache.New(cl)
+	if err := cqCache.AddClusterQueue(ctx, oldCQ); err != nil {
+		t.Fatalf("Adding old ClusterQueue to scheduler cache: %v", err)
+	}
+	oldWorkload := utiltestingapi.MakeWorkload("wl", lq.Namespace).
+		Queue(kueue.LocalQueueName(lq.Name)).
+		Request(corev1.ResourceCPU, "4").
+		SimpleReserveQuota("cq", "default", now).
+		AdmittedAt(true, now).
+		Obj()
+	if !cqCache.AddOrUpdateWorkload(log, oldWorkload) {
+		t.Fatal("Adding old workload to scheduler cache")
+	}
+	qManager := qcache.NewManagerForUnitTests(cl, cqCache)
+	if err := qManager.AddClusterQueue(ctx, oldCQ); err != nil {
+		t.Fatalf("Adding old ClusterQueue to queue manager: %v", err)
+	}
+	if err := qManager.AddLocalQueue(ctx, lq); err != nil {
+		t.Fatalf("Adding LocalQueue to queue manager: %v", err)
+	}
+	reconciler := NewLocalQueueReconciler(cl, qManager, cqCache)
+	request := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(lq)}
+
+	result, err := reconciler.Reconcile(ctx, request)
+	if err != nil {
+		t.Fatalf("First Reconcile() error: %v", err)
+	}
+	if result.RequeueAfter != constants.UpdatesBatchPeriod {
+		t.Fatalf("First Reconcile() result = %v, want requeue after %v", result, constants.UpdatesBatchPeriod)
+	}
+	var first kueue.LocalQueue
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(lq), &first); err != nil {
+		t.Fatalf("Getting LocalQueue after first reconcile: %v", err)
+	}
+	if len(first.Status.Conditions) != 0 || first.Status.AdmittedWorkloads != 0 || len(first.Status.FlavorsUsage) != 0 {
+		t.Fatalf("Published status across ClusterQueue incarnations: %+v", first.Status)
+	}
+
+	if err := cqCache.EnsureClusterQueue(ctx, newCQ); err != nil {
+		t.Fatalf("Replacing ClusterQueue in scheduler cache: %v", err)
+	}
+	if err := qManager.EnsureClusterQueue(ctx, newCQ); err != nil {
+		t.Fatalf("Replacing ClusterQueue in queue manager: %v", err)
+	}
+	if _, err := reconciler.Reconcile(ctx, request); err != nil {
+		t.Fatalf("Second Reconcile() error: %v", err)
+	}
+	var second kueue.LocalQueue
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(lq), &second); err != nil {
+		t.Fatalf("Getting LocalQueue after second reconcile: %v", err)
+	}
+	condition := apimeta.FindStatusCondition(second.Status.Conditions, kueue.LocalQueueActive)
+	if condition == nil || condition.Status != metav1.ConditionTrue || condition.Reason != "Ready" {
+		t.Fatalf("Active condition after synchronization = %v, want True/Ready", condition)
+	}
+	if second.Status.AdmittedWorkloads != 0 || second.Status.ReservingWorkloads != 0 {
+		t.Fatalf("Usage after synchronization = admitted %d, reserving %d; want zero",
+			second.Status.AdmittedWorkloads, second.Status.ReservingWorkloads)
+	}
+}
+
+func TestStoppedLocalQueueConditionDuringClusterQueueReplacement(t *testing.T) {
+	oldCQ := utiltestingapi.MakeClusterQueue("cq").Obj()
+	oldCQ.UID = "old"
+	newCQ := oldCQ.DeepCopy()
+	newCQ.UID = "new"
+	lq := utiltestingapi.MakeLocalQueue("lq", "ns").
+		ClusterQueue(oldCQ.Name).
+		StopPolicy(kueue.Hold).
+		Active(metav1.ConditionTrue).
+		Obj()
+	objects := []client.Object{newCQ, lq}
+	cl := utiltesting.NewClientBuilder().
+		WithObjects(objects...).
+		WithStatusSubresource(objects...).
+		WithInterceptorFuncs(interceptor.Funcs{SubResourcePatch: utiltesting.TreatSSAAsStrategicMerge}).
+		Build()
+	cqCache := schdcache.New(cl)
+	ctx, _ := utiltesting.ContextWithLog(t)
+	if err := cqCache.AddClusterQueue(ctx, oldCQ); err != nil {
+		t.Fatalf("Adding old ClusterQueue: %v", err)
+	}
+	reconciler := NewLocalQueueReconciler(cl, nil, cqCache)
+
+	result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(lq)})
+	if err != nil {
+		t.Fatalf("Reconcile() error: %v", err)
+	}
+	if result.RequeueAfter != constants.UpdatesBatchPeriod {
+		t.Fatalf("Reconcile() result = %v, want requeue after %v", result, constants.UpdatesBatchPeriod)
+	}
+	var got kueue.LocalQueue
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(lq), &got); err != nil {
+		t.Fatalf("Getting LocalQueue: %v", err)
+	}
+	condition := apimeta.FindStatusCondition(got.Status.Conditions, kueue.LocalQueueActive)
+	if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != StoppedReason {
+		t.Fatalf("Active condition = %v, want False/%s", condition, StoppedReason)
+	}
+}
+
+func TestLocalQueueClusterQueueHandlerEnqueuesReplacement(t *testing.T) {
+	oldCQ := utiltestingapi.MakeClusterQueue("cq").Obj()
+	oldCQ.UID = "old"
+	newCQ := oldCQ.DeepCopy()
+	newCQ.UID = "new"
+	lq := utiltestingapi.MakeLocalQueue("lq", "ns").ClusterQueue(oldCQ.Name).Obj()
+	handler := qCQHandler{client: utiltesting.NewClientBuilder().WithObjects(lq).Build()}
+	queue := &utiltesting.MockTypedRateLimitingInterface{}
+	ctx, _ := utiltesting.ContextWithLog(t)
+
+	handler.Update(ctx, event.UpdateEvent{ObjectOld: oldCQ, ObjectNew: newCQ}, queue)
+
+	want := []reconcile.Request{{NamespacedName: client.ObjectKeyFromObject(lq)}}
+	if diff := cmp.Diff(want, queue.Items); diff != "" {
+		t.Errorf("Enqueued requests mismatch (-want,+got):\n%s", diff)
 	}
 }
 
