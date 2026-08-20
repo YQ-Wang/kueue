@@ -45,6 +45,7 @@ import (
 	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
 	testingmetrics "sigs.k8s.io/kueue/pkg/util/testing/metrics"
 	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
+	"sigs.k8s.io/kueue/pkg/workload"
 )
 
 type countingClusterQueueUpdateWatcher struct {
@@ -420,8 +421,11 @@ func TestClusterQueueReconcileRepairsCacheIncarnation(t *testing.T) {
 	if usageAfterFailure.ClusterQueueUID != newCQ.UID {
 		t.Fatalf("Scheduler cache UID after partial repair = %q, want %q", usageAfterFailure.ClusterQueueUID, newCQ.UID)
 	}
-	if _, err := qManager.Pending(newCQ); !errors.Is(err, qcache.ErrClusterQueueDoesNotExist) {
-		t.Fatalf("Queue manager error after failed replacement = %v, want %v", err, qcache.ErrClusterQueueDoesNotExist)
+	if cqCache.ClusterQueueActive(kueue.ClusterQueueReference(newCQ.Name)) {
+		t.Fatal("Scheduler cache activated replacement before queue manager replacement completed")
+	}
+	if _, err := qManager.Pending(newCQ); !errors.Is(err, qcache.ErrClusterQueueUIDMismatch) {
+		t.Fatalf("Queue manager error after failed replacement = %v, want %v", err, qcache.ErrClusterQueueUIDMismatch)
 	}
 
 	failQueueManagerList = false
@@ -525,13 +529,251 @@ func TestClusterQueueDeleteIgnoresStaleIncarnation(t *testing.T) {
 	}
 }
 
-func TestClusterQueueDeleteSkipsCleanupWhenAPIWasRecreated(t *testing.T) {
+func TestClusterQueueRepairDoesNotResurrectDeletedIncarnation(t *testing.T) {
+	ctx, log := utiltesting.ContextWithLog(t)
+	cq := utiltestingapi.MakeClusterQueue("cq").Obj()
+	cq.UID = "uid"
+	lq := utiltestingapi.MakeLocalQueue("lq", "ns").ClusterQueue(cq.Name).Obj()
+	cl := utiltesting.NewClientBuilder().WithObjects(cq, lq).Build()
+	cqCache := schdcache.New(cl)
+	qManager := qcache.NewManagerForUnitTests(cl, cqCache)
+	if err := cqCache.AddClusterQueue(ctx, cq); err != nil {
+		t.Fatalf("Adding ClusterQueue to scheduler cache: %v", err)
+	}
+	if err := qManager.AddClusterQueue(ctx, cq); err != nil {
+		t.Fatalf("Adding ClusterQueue to queue manager: %v", err)
+	}
+	reconciler := &ClusterQueueReconciler{
+		logName:  "cluster-queue-reconciler",
+		client:   cl,
+		cache:    cqCache,
+		qManager: qManager,
+	}
+
+	if !cqCache.DeleteClusterQueue(cq) || !qManager.DeleteClusterQueue(log, cq) {
+		t.Fatal("Deleting ClusterQueue caches")
+	}
+	if err := cl.Delete(ctx, cq); err != nil {
+		t.Fatalf("Deleting ClusterQueue API object: %v", err)
+	}
+	// Models a reconcile that fetched the object before the Delete event, then
+	// reached its cache-repair step after deletion completed.
+	if err := reconciler.repairClusterQueueCaches(ctx, cq); err != nil {
+		t.Fatalf("Repairing stale ClusterQueue: %v", err)
+	}
+
+	usage, err := cqCache.LocalQueueUsage(lq)
+	if err != nil {
+		t.Fatalf("Reading LocalQueue usage: %v", err)
+	}
+	if usage.ClusterQueueExists {
+		t.Fatalf("Stale repair resurrected scheduler cache entry: %+v", usage)
+	}
+	if _, err := qManager.Pending(cq); !errors.Is(err, qcache.ErrClusterQueueDoesNotExist) {
+		t.Fatalf("Queue manager Pending() error = %v, want %v", err, qcache.ErrClusterQueueDoesNotExist)
+	}
+}
+
+func TestClusterQueueRepairInitializesAbsentCaches(t *testing.T) {
+	ctx, _ := utiltesting.ContextWithLog(t)
+	cq := utiltestingapi.MakeClusterQueue("cq").Obj()
+	cq.UID = "uid"
+	lq := utiltestingapi.MakeLocalQueue("lq", "ns").ClusterQueue(cq.Name).Obj()
+	cl := utiltesting.NewClientBuilder().WithObjects(cq, lq).Build()
+	cqCache := schdcache.New(cl)
+	qManager := qcache.NewManagerForUnitTests(cl, cqCache)
+	reconciler := &ClusterQueueReconciler{
+		logName:  "cluster-queue-reconciler",
+		client:   cl,
+		cache:    cqCache,
+		qManager: qManager,
+	}
+
+	if err := reconciler.repairClusterQueueCaches(ctx, cq); err != nil {
+		t.Fatalf("Initializing caches: %v", err)
+	}
+
+	usage, err := cqCache.LocalQueueUsage(lq)
+	if err != nil {
+		t.Fatalf("Reading LocalQueue usage: %v", err)
+	}
+	if !usage.ClusterQueueExists || usage.ClusterQueueUID != cq.UID {
+		t.Fatalf("Scheduler cache was not initialized: %+v", usage)
+	}
+	if _, err := qManager.Pending(cq); err != nil {
+		t.Fatalf("Queue manager was not initialized: %v", err)
+	}
+}
+
+func TestClusterQueueRepairDoesNotRollBackToStaleIncarnation(t *testing.T) {
 	ctx, _ := utiltesting.ContextWithLog(t)
 	oldCQ := utiltestingapi.MakeClusterQueue("cq").Obj()
 	oldCQ.UID = "old"
 	newCQ := oldCQ.DeepCopy()
 	newCQ.UID = "new"
-	cl := utiltesting.NewClientBuilder().WithObjects(newCQ).Build()
+	lq := utiltestingapi.MakeLocalQueue("lq", "ns").ClusterQueue(newCQ.Name).Obj()
+	cl := utiltesting.NewClientBuilder().WithObjects(newCQ, lq).Build()
+	cqCache := schdcache.New(cl)
+	qManager := qcache.NewManagerForUnitTests(cl, cqCache)
+	if err := cqCache.AddClusterQueue(ctx, newCQ); err != nil {
+		t.Fatalf("Adding current ClusterQueue to scheduler cache: %v", err)
+	}
+	if err := qManager.AddClusterQueue(ctx, newCQ); err != nil {
+		t.Fatalf("Adding current ClusterQueue to queue manager: %v", err)
+	}
+	reconciler := &ClusterQueueReconciler{
+		logName:  "cluster-queue-reconciler",
+		client:   cl,
+		cache:    cqCache,
+		qManager: qManager,
+	}
+
+	if err := reconciler.repairClusterQueueCaches(ctx, oldCQ); err != nil {
+		t.Fatalf("Repairing stale incarnation: %v", err)
+	}
+
+	usage, err := cqCache.LocalQueueUsage(lq)
+	if err != nil {
+		t.Fatalf("Reading LocalQueue usage: %v", err)
+	}
+	if usage.ClusterQueueUID != newCQ.UID {
+		t.Fatalf("Stale repair rolled scheduler cache back to UID %q", usage.ClusterQueueUID)
+	}
+	if _, err := qManager.Pending(newCQ); err != nil {
+		t.Fatalf("Stale repair rolled queue manager back: %v", err)
+	}
+}
+
+func TestClusterQueueReplacementActivatesAfterBothCachesSwap(t *testing.T) {
+	ctx, _ := utiltesting.ContextWithLog(t)
+	oldCQ := utiltestingapi.MakeClusterQueue("cq").Obj()
+	oldCQ.UID = "old"
+	newCQ := oldCQ.DeepCopy()
+	newCQ.UID = "new"
+	lq := utiltestingapi.MakeLocalQueue("lq", "ns").ClusterQueue(newCQ.Name).Obj()
+	wl := utiltestingapi.MakeWorkload("wl", lq.Namespace).Queue(kueue.LocalQueueName(lq.Name)).Obj()
+	cl := utiltesting.NewClientBuilder().WithObjects(newCQ, lq, wl).Build()
+	cqCache := schdcache.New(cl)
+	qManager := qcache.NewManagerForUnitTests(cl, cqCache)
+	if err := cqCache.AddClusterQueue(ctx, oldCQ); err != nil {
+		t.Fatalf("Adding old ClusterQueue to scheduler cache: %v", err)
+	}
+	if err := qManager.AddClusterQueue(ctx, oldCQ); err != nil {
+		t.Fatalf("Adding old ClusterQueue to queue manager: %v", err)
+	}
+	if err := qManager.AddLocalQueue(ctx, lq); err != nil {
+		t.Fatalf("Adding LocalQueue: %v", err)
+	}
+
+	if pending, err := cqCache.ReplaceClusterQueue(ctx, newCQ); err != nil || !pending {
+		t.Fatalf("Replacing scheduler cache: pending=%t, error=%v", pending, err)
+	}
+	if err := qManager.ReplaceClusterQueue(ctx, newCQ); err != nil {
+		t.Fatalf("Replacing queue manager: %v", err)
+	}
+
+	headsCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go qManager.CleanUpOnContext(headsCtx)
+	headsCh := make(chan []qcache.Head, 1)
+	go func() {
+		headsCh <- qManager.Heads(headsCtx)
+	}()
+	select {
+	case heads := <-headsCh:
+		t.Fatalf("Heads returned before scheduler-cache activation: %v", heads)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	if !cqCache.CompleteClusterQueueReplacement(kueue.ClusterQueueReference(newCQ.Name), newCQ.UID) {
+		t.Fatal("Completing scheduler-cache replacement")
+	}
+	qManager.WakeUp()
+	select {
+	case heads := <-headsCh:
+		if len(heads) != 1 || workload.Key(heads[0].Obj) != workload.Key(wl) {
+			t.Fatalf("Heads after activation = %v, want workload %s", heads, workload.Key(wl))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Heads remained blocked after replacement activation")
+	}
+}
+
+func TestClusterQueueRepairWaitsForPendingAssumption(t *testing.T) {
+	now := time.Now()
+	ctx, log := utiltesting.ContextWithLog(t)
+	oldCQ := utiltestingapi.MakeClusterQueue("cq").
+		ResourceGroup(*utiltestingapi.MakeFlavorQuotas("default").Resource(corev1.ResourceCPU, "10").Obj()).
+		Obj()
+	oldCQ.UID = "old"
+	newCQ := oldCQ.DeepCopy()
+	newCQ.UID = "new"
+	lq := utiltestingapi.MakeLocalQueue("lq", "ns").ClusterQueue(newCQ.Name).Obj()
+	apiWorkload := utiltestingapi.MakeWorkload("wl", lq.Namespace).
+		Queue(kueue.LocalQueueName(lq.Name)).
+		Request(corev1.ResourceCPU, "4").
+		Obj()
+	assumedWorkload := utiltestingapi.MakeWorkload(apiWorkload.Name, apiWorkload.Namespace).
+		Queue(kueue.LocalQueueName(lq.Name)).
+		Request(corev1.ResourceCPU, "4").
+		SimpleReserveQuota(kueue.ClusterQueueReference(oldCQ.Name), "default", now).
+		Obj()
+	cl := utiltesting.NewClientBuilder().WithObjects(newCQ, lq, apiWorkload).Build()
+	cqCache := schdcache.New(cl)
+	qManager := qcache.NewManagerForUnitTests(cl, cqCache)
+	cqCache.AddOrUpdateResourceFlavor(log, utiltestingapi.MakeResourceFlavor("default").Obj())
+	if err := cqCache.AddClusterQueue(ctx, oldCQ); err != nil {
+		t.Fatalf("Adding old ClusterQueue to scheduler cache: %v", err)
+	}
+	if !cqCache.AddOrUpdateWorkload(log, assumedWorkload) {
+		t.Fatal("Adding assumed workload")
+	}
+	if err := qManager.AddClusterQueue(ctx, oldCQ); err != nil {
+		t.Fatalf("Adding old ClusterQueue to queue manager: %v", err)
+	}
+	reconciler := &ClusterQueueReconciler{
+		logName:  "cluster-queue-reconciler",
+		client:   cl,
+		cache:    cqCache,
+		qManager: qManager,
+	}
+
+	if err := reconciler.repairClusterQueueCaches(ctx, newCQ); !errors.Is(err, schdcache.ErrCqAssumptions) {
+		t.Fatalf("Repair error = %v, want %v", err, schdcache.ErrCqAssumptions)
+	}
+	usage, err := cqCache.LocalQueueUsage(lq)
+	if err != nil {
+		t.Fatalf("Reading retained usage: %v", err)
+	}
+	if usage.ClusterQueueUID != oldCQ.UID || usage.ReservingWorkloads != 1 {
+		t.Fatalf("Pending assumption did not retain old usage: %+v", usage)
+	}
+	if cqCache.ClusterQueueActive(kueue.ClusterQueueReference(oldCQ.Name)) {
+		t.Fatal("Old incarnation remained active while an assumption was pending")
+	}
+	if _, err := qManager.Pending(newCQ); !errors.Is(err, qcache.ErrClusterQueueUIDMismatch) {
+		t.Fatalf("Queue manager changed before assumption settled: %v", err)
+	}
+
+	if err := cqCache.DeleteWorkload(log, workload.Key(assumedWorkload)); err != nil {
+		t.Fatalf("Deleting failed assumption: %v", err)
+	}
+	if err := reconciler.repairClusterQueueCaches(ctx, newCQ); err != nil {
+		t.Fatalf("Repairing after assumption cleanup: %v", err)
+	}
+	if !cqCache.ClusterQueueActive(kueue.ClusterQueueReference(newCQ.Name)) {
+		t.Fatal("Replacement did not activate after assumption cleanup")
+	}
+}
+
+func TestClusterQueueDeleteThenCreateConverges(t *testing.T) {
+	ctx, _ := utiltesting.ContextWithLog(t)
+	oldCQ := utiltestingapi.MakeClusterQueue("cq").Obj()
+	oldCQ.UID = "old"
+	newCQ := oldCQ.DeepCopy()
+	newCQ.UID = "new"
+	lq := utiltestingapi.MakeLocalQueue("lq", "ns").ClusterQueue(newCQ.Name).Obj()
+	cl := utiltesting.NewClientBuilder().WithObjects(newCQ, lq).Build()
 	cqCache := schdcache.New(cl)
 	qManager := qcache.NewManagerForUnitTests(cl, cqCache)
 	if err := cqCache.AddClusterQueue(ctx, oldCQ); err != nil {
@@ -551,8 +793,23 @@ func TestClusterQueueDeleteSkipsCleanupWhenAPIWasRecreated(t *testing.T) {
 
 	reconciler.Delete(event.TypedDeleteEvent[*kueue.ClusterQueue]{Object: oldCQ})
 
-	if watcher.calls != 0 {
-		t.Fatalf("Delete notified watchers %d times after API recreation, want 0", watcher.calls)
+	if watcher.calls != 1 {
+		t.Fatalf("Delete notified watchers %d times after API recreation, want 1", watcher.calls)
+	}
+
+	reconciler.Create(event.TypedCreateEvent[*kueue.ClusterQueue]{Object: newCQ})
+	usage, err := cqCache.LocalQueueUsage(lq)
+	if err != nil {
+		t.Fatalf("Reading LocalQueue usage: %v", err)
+	}
+	if !usage.ClusterQueueExists || usage.ClusterQueueUID != newCQ.UID {
+		t.Fatalf("Scheduler cache did not converge to recreated ClusterQueue: %+v", usage)
+	}
+	if _, err := qManager.Pending(newCQ); err != nil {
+		t.Fatalf("Queue manager did not converge to recreated ClusterQueue: %v", err)
+	}
+	if watcher.calls != 2 {
+		t.Fatalf("Delete/Create notified watchers %d times, want 2", watcher.calls)
 	}
 }
 

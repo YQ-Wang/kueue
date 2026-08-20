@@ -202,7 +202,7 @@ func TestAddClusterQueueOrphans(t *testing.T) {
 	}
 }
 
-func TestEnsureClusterQueueReplacesIncarnation(t *testing.T) {
+func TestReplaceClusterQueueReplacesIncarnation(t *testing.T) {
 	ctx, log := utiltesting.ContextWithLog(t)
 	lq := utiltestingapi.MakeLocalQueue("lq", "ns").ClusterQueue("cq").Obj()
 	wl := utiltestingapi.MakeWorkload("wl", lq.Namespace).Queue(kueue.LocalQueueName(lq.Name)).Obj()
@@ -232,14 +232,14 @@ func TestEnsureClusterQueueReplacesIncarnation(t *testing.T) {
 	if err := manager.UpdateClusterQueue(ctx, newCQ, false); !errors.Is(err, ErrClusterQueueUIDMismatch) {
 		t.Fatalf("UpdateClusterQueue() error = %v, want %v", err, ErrClusterQueueUIDMismatch)
 	}
-	if err := manager.EnsureClusterQueue(ctx, oldCQ); err != nil {
-		t.Fatalf("Ensuring same incarnation: %v", err)
+	if err := manager.ReplaceClusterQueue(ctx, oldCQ); err != nil {
+		t.Fatalf("Replacing same incarnation: %v", err)
 	}
 	if manager.hm.ClusterQueue("cq").trackedInfo(wlKey).LastAssignment == nil {
 		t.Fatal("Same-incarnation ensure cleared LastAssignment")
 	}
 
-	if err := manager.EnsureClusterQueue(ctx, newCQ); err != nil {
+	if err := manager.ReplaceClusterQueue(ctx, newCQ); err != nil {
 		t.Fatalf("Replacing ClusterQueue: %v", err)
 	}
 	replacement := manager.hm.ClusterQueue("cq")
@@ -253,6 +253,9 @@ func TestEnsureClusterQueueReplacesIncarnation(t *testing.T) {
 	if replacementInfo.LastAssignment != nil {
 		t.Fatalf("Replacement retained LastAssignment: %+v", replacementInfo.LastAssignment)
 	}
+	if lqInfo := manager.localQueues[queue.Key(lq)].items[wlKey]; lqInfo != replacementInfo {
+		t.Fatal("Replacement ClusterQueue and LocalQueue do not share the same Workload Info")
+	}
 
 	manager.DeleteClusterQueue(log, oldCQ)
 	if got := manager.hm.ClusterQueue("cq"); got == nil || got.uid != newCQ.UID {
@@ -260,7 +263,7 @@ func TestEnsureClusterQueueReplacesIncarnation(t *testing.T) {
 	}
 }
 
-func TestEnsureClusterQueueAfterDeleteResetsLastAssignment(t *testing.T) {
+func TestAddClusterQueueAfterDeleteResetsLastAssignment(t *testing.T) {
 	ctx, log := utiltesting.ContextWithLog(t)
 	lq := utiltestingapi.MakeLocalQueue("lq", "ns").ClusterQueue("cq").Obj()
 	wl := utiltestingapi.MakeWorkload("wl", lq.Namespace).Queue(kueue.LocalQueueName(lq.Name)).Obj()
@@ -284,7 +287,7 @@ func TestEnsureClusterQueueAfterDeleteResetsLastAssignment(t *testing.T) {
 	if deleted := manager.DeleteClusterQueue(log, oldCQ); !deleted {
 		t.Fatal("Deleting old ClusterQueue was rejected")
 	}
-	if err := manager.EnsureClusterQueue(ctx, newCQ); err != nil {
+	if err := manager.AddClusterQueue(ctx, newCQ); err != nil {
 		t.Fatalf("Adding replacement ClusterQueue: %v", err)
 	}
 	replacementInfo := manager.hm.ClusterQueue("cq").trackedInfo(wlKey)

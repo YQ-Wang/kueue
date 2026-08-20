@@ -86,6 +86,8 @@ type clusterQueue struct {
 	tasFlavors                         map[kueue.ResourceFlavorReference]kueue.TopologyReference
 	admittedWorkloadsCount             int
 	isStopped                          bool
+	replacementPending                 bool
+	metricsSuppressed                  bool
 	workloadInfoOptions                []workload.InfoOption
 	resourceFormatter                  *resources.ResourceFormatter
 
@@ -140,7 +142,7 @@ func (c *clusterQueue) parentHRN() hierarchicalResourceNode {
 }
 
 func (c *clusterQueue) Active() bool {
-	return c.Status == active
+	return c.Status == active && !c.replacementPending
 }
 
 var defaultPreemption = kueue.ClusterQueuePreemption{
@@ -271,8 +273,19 @@ func (c *clusterQueue) updateQueueStatus(log logr.Logger) {
 	if status != c.Status {
 		log.V(3).Info("Updating status in cache", "clusterQueue", c.Name, "newStatus", status, "oldStatus", c.Status)
 		c.Status = status
-		metrics.ReportClusterQueueStatus(c.Name, c.Status, c.GetCustomLabelValues(), c.roleTracker)
+		c.reportStatus()
 	}
+}
+
+func (c *clusterQueue) reportStatus() {
+	if c.metricsSuppressed {
+		return
+	}
+	status := c.Status
+	if c.replacementPending && status != terminating {
+		status = pending
+	}
+	metrics.ReportClusterQueueStatus(c.Name, status, c.GetCustomLabelValues(), c.roleTracker)
 }
 
 // ensureTASIsSynced makes sure all TAS workloads are accounted (TAS cache is synced),

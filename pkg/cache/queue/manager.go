@@ -328,29 +328,79 @@ func (m *Manager) AddClusterQueue(ctx context.Context, cq *kueue.ClusterQueue) e
 	if cq := m.hm.ClusterQueue(kueue.ClusterQueueReference(cq.Name)); cq != nil {
 		return errClusterQueueAlreadyExists
 	}
-	return m.addClusterQueueLocked(ctx, cq, false, false)
+	return m.addClusterQueueLocked(ctx, cq, true)
 }
 
-// EnsureClusterQueue makes sure the queue manager contains the observed
-// ClusterQueue incarnation. A replacement rebuilds queue-local scheduling
-// state and clears flavor scan progress recorded against the old incarnation.
-func (m *Manager) EnsureClusterQueue(ctx context.Context, cq *kueue.ClusterQueue) error {
+// ReplaceClusterQueue stages the observed ClusterQueue before swapping it into
+// the queue manager.
+func (m *Manager) ReplaceClusterQueue(ctx context.Context, cq *kueue.ClusterQueue) error {
 	m.Lock()
 	defer m.Unlock()
 
 	cqImpl := m.hm.ClusterQueue(kueue.ClusterQueueReference(cq.Name))
-	if cqImpl == nil {
-		return m.addClusterQueueLocked(ctx, cq, true, true)
-	}
-	if cqImpl.uid == cq.UID {
+	if cqImpl != nil && cqImpl.uid == cq.UID {
 		return nil
 	}
 
-	m.deleteClusterQueueLocked(ctrl.LoggerFrom(ctx), cqImpl)
-	return m.addClusterQueueLocked(ctx, cq, true, true)
+	var queues kueue.LocalQueueList
+	if err := m.client.List(ctx, &queues, client.MatchingFields{utilindexer.QueueClusterQueueKey: cq.Name}); err != nil {
+		return fmt.Errorf("listing queues pointing to the cluster queue: %w", err)
+	}
+
+	var afsUsageLedger *queueafs.AfsUsageLedger
+	if afs.Enabled(m.admissionFairSharingConfig) {
+		afsUsageLedger = m.AfsUsageLedger
+	}
+	replacement, err := newClusterQueue(ctx, m.client, cq, m.customLabels, m.workloadOrdering, m.admissionFairSharingConfig, afsUsageLedger)
+	if err != nil {
+		return err
+	}
+	addedWorkloads := false
+	stagedQueues := make(map[queue.LocalQueueReference]*LocalQueue, len(queues.Items))
+	for i := range queues.Items {
+		q := &queues.Items[i]
+		qImpl := m.localQueues[queue.Key(q)]
+		if qImpl == nil {
+			continue
+		}
+		stagedQueue := &LocalQueue{
+			Key:               qImpl.Key,
+			ClusterQueue:      qImpl.ClusterQueue,
+			items:             make(map[workload.Reference]*workload.Info, len(qImpl.items)),
+			finishedWorkloads: qImpl.finishedWorkloads.Clone(),
+			labels:            qImpl.labels,
+		}
+		for ref, info := range qImpl.items {
+			infoCopy := *info
+			infoCopy.LastAssignment = nil
+			stagedQueue.items[ref] = &infoCopy
+		}
+		replacement.addLocalQueue(queue.Key(q), afs.LQWeightAsFloat64(q))
+		addedWorkloads = replacement.AddFromLocalQueue(stagedQueue, m.roleTracker, m.customLabels) || addedWorkloads
+		stagedQueues[qImpl.Key] = stagedQueue
+	}
+
+	if cqImpl != nil {
+		m.deleteClusterQueueLocked(ctrl.LoggerFrom(ctx), cqImpl)
+	}
+	m.hm.AddClusterQueue(replacement)
+	m.hm.UpdateClusterQueueEdge(kueue.ClusterQueueReference(cq.Name), cq.Spec.CohortName)
+	for key, stagedQueue := range stagedQueues {
+		if qImpl := m.localQueues[key]; qImpl != nil {
+			// Keep the LocalQueue and ClusterQueue views sharing the same Info
+			// pointers, as they do on the normal add path.
+			qImpl.items = stagedQueue.items
+		}
+	}
+	notifyRetryInadmissibleWithoutLock(m, sets.New(replacement.name))
+	m.resyncClusterQueueGaugeMetricsLocked(replacement)
+	if addedWorkloads {
+		m.Broadcast()
+	}
+	return nil
 }
 
-func (m *Manager) addClusterQueueLocked(ctx context.Context, cq *kueue.ClusterQueue, resetLastAssignment, cleanupOnError bool) (err error) {
+func (m *Manager) addClusterQueueLocked(ctx context.Context, cq *kueue.ClusterQueue, resetLastAssignment bool) error {
 	var afsUsageLedger *queueafs.AfsUsageLedger
 	if afs.Enabled(m.admissionFairSharingConfig) {
 		afsUsageLedger = m.AfsUsageLedger
@@ -361,12 +411,6 @@ func (m *Manager) addClusterQueueLocked(ctx context.Context, cq *kueue.ClusterQu
 	}
 	m.hm.AddClusterQueue(cqImpl)
 	m.hm.UpdateClusterQueueEdge(kueue.ClusterQueueReference(cq.Name), cq.Spec.CohortName)
-	complete := false
-	defer func() {
-		if cleanupOnError && !complete {
-			m.deleteClusterQueueLocked(ctrl.LoggerFrom(ctx), cqImpl)
-		}
-	}()
 
 	// Iterate through existing queues, as queues corresponding to this cluster
 	// queue might have been added earlier.
@@ -403,7 +447,6 @@ func (m *Manager) addClusterQueueLocked(ctx context.Context, cq *kueue.ClusterQu
 	if addedWorkloads {
 		m.Broadcast()
 	}
-	complete = true
 	return nil
 }
 
@@ -1009,6 +1052,14 @@ func (m *Manager) heads() []Head {
 
 func (m *Manager) Broadcast() {
 	m.cond.Broadcast()
+}
+
+// WakeUp broadcasts while holding the condition lock, preventing a lost
+// wakeup when a state transition happens outside the queue manager.
+func (m *Manager) WakeUp() {
+	m.Lock()
+	defer m.Unlock()
+	m.Broadcast()
 }
 
 func (m *Manager) GetClusterQueueNames() []kueue.ClusterQueueReference {

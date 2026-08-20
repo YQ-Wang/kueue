@@ -193,7 +193,27 @@ func New(client client.Client, options ...Option) *Cache {
 }
 
 func (c *Cache) newClusterQueue(log logr.Logger, cq *kueue.ClusterQueue) (*clusterQueue, error) {
-	cqImpl := &clusterQueue{
+	cqImpl := c.newClusterQueueImpl(cq)
+	c.hm.AddClusterQueue(cqImpl)
+	c.hm.UpdateClusterQueueEdge(kueue.ClusterQueueReference(cq.Name), cq.Spec.CohortName)
+	if err := cqImpl.updateClusterQueue(log, cq, c.resourceFlavors, c.admissionChecks, nil); err != nil {
+		return nil, err
+	}
+
+	return cqImpl, nil
+}
+
+func (c *Cache) newDetachedClusterQueue(log logr.Logger, cq *kueue.ClusterQueue) (*clusterQueue, error) {
+	cqImpl := c.newClusterQueueImpl(cq)
+	cqImpl.metricsSuppressed = true
+	if err := cqImpl.updateClusterQueue(log, cq, c.resourceFlavors, c.admissionChecks, nil); err != nil {
+		return nil, err
+	}
+	return cqImpl, nil
+}
+
+func (c *Cache) newClusterQueueImpl(cq *kueue.ClusterQueue) *clusterQueue {
+	return &clusterQueue{
 		Name:                kueue.ClusterQueueReference(cq.Name),
 		UID:                 cq.UID,
 		Workloads:           make(map[workload.Reference]*workload.Info),
@@ -210,13 +230,6 @@ func (c *Cache) newClusterQueue(log logr.Logger, cq *kueue.ClusterQueue) (*clust
 		lqMetrics:           c.lqMetrics,
 		customLabels:        c.customLabels,
 	}
-	c.hm.AddClusterQueue(cqImpl)
-	c.hm.UpdateClusterQueueEdge(kueue.ClusterQueueReference(cq.Name), cq.Spec.CohortName)
-	if err := cqImpl.updateClusterQueue(log, cq, c.resourceFlavors, c.admissionChecks, nil); err != nil {
-		return nil, err
-	}
-
-	return cqImpl, nil
 }
 
 // WaitForPodsReady waits for all admitted workloads to be in the PodsReady condition
@@ -280,14 +293,13 @@ func (c *Cache) updateClusterQueues(log logr.Logger) sets.Set[kueue.ClusterQueue
 	cqs := sets.New[kueue.ClusterQueueReference]()
 
 	for _, cq := range c.hm.ClusterQueues() {
-		prevStatus := cq.Status
+		wasActive := cq.Active()
 		// We call update on all ClusterQueues irrespective of which CQ actually use this flavor
 		// because it is not expensive to do so, and is not worth tracking which ClusterQueues use
 		// which flavors.
 		cq.UpdateWithFlavors(log, c.resourceFlavors)
 		cq.updateWithAdmissionChecks(log, c.admissionChecks)
-		curStatus := cq.Status
-		if prevStatus == pending && curStatus == active {
+		if !wasActive && cq.Active() {
 			cqs.Insert(cq.Name)
 		}
 	}
@@ -299,7 +311,7 @@ func (c *Cache) ActiveClusterQueues() sets.Set[kueue.ClusterQueueReference] {
 	defer c.RUnlock()
 	cqs := sets.New[kueue.ClusterQueueReference]()
 	for _, cq := range c.hm.ClusterQueues() {
-		if cq.Status == active {
+		if cq.Active() {
 			cqs.Insert(cq.Name)
 		}
 	}
@@ -418,7 +430,10 @@ func (c *Cache) ClusterQueueReadiness(name kueue.ClusterQueueReference) (metav1.
 	if cq == nil {
 		return metav1.ConditionFalse, "NotFound", "ClusterQueue not found"
 	}
-	if cq.Status == active {
+	if cq.replacementPending {
+		return metav1.ConditionFalse, kueue.ClusterQueueActiveReasonUnknown, "Can't admit new workloads; ClusterQueue cache replacement is pending"
+	}
+	if cq.Active() {
 		return metav1.ConditionTrue, "Ready", "Can admit new workloads"
 	}
 	reason, msg := cq.inactiveReason()
@@ -433,6 +448,9 @@ func (c *Cache) clusterQueueInStatus(name kueue.ClusterQueueReference, status me
 	if cq == nil {
 		return false
 	}
+	if status == active {
+		return cq.Active()
+	}
 	return cq.Status == status
 }
 
@@ -446,7 +464,7 @@ func (c *Cache) TerminateClusterQueue(name kueue.ClusterQueueReference) {
 
 func (c *Cache) terminateClusterQueueLocked(cq *clusterQueue) {
 	cq.Status = terminating
-	metrics.ReportClusterQueueStatus(cq.Name, cq.Status, cq.GetCustomLabelValues(), c.roleTracker)
+	cq.reportStatus()
 }
 
 // ClusterQueueEmpty indicates whether there's any active workload admitted by
@@ -469,33 +487,128 @@ func (c *Cache) AddClusterQueue(ctx context.Context, cq *kueue.ClusterQueue) err
 	if oldCq := c.hm.ClusterQueue(kueue.ClusterQueueReference(cq.Name)); oldCq != nil {
 		return errors.New("ClusterQueue already exists")
 	}
-	return c.addClusterQueueLocked(ctx, cq, false)
+	return c.addClusterQueueLocked(ctx, cq)
 }
 
-// EnsureClusterQueue makes sure the cache contains the observed ClusterQueue
-// incarnation. Existing state is preserved when the UID matches and rebuilt
-// from API objects when it does not.
-func (c *Cache) EnsureClusterQueue(ctx context.Context, cq *kueue.ClusterQueue) error {
+// ReplaceClusterQueue stages the observed ClusterQueue before installing it,
+// preserving a different old incarnation until all fallible preparation has
+// completed. It returns whether activation is pending on the queue-manager side
+// of the transition.
+func (c *Cache) ReplaceClusterQueue(ctx context.Context, cq *kueue.ClusterQueue) (bool, error) {
 	c.Lock()
 	defer c.Unlock()
 
 	cqImpl := c.hm.ClusterQueue(kueue.ClusterQueueReference(cq.Name))
-	if cqImpl == nil {
-		return c.addClusterQueueLocked(ctx, cq, true)
-	}
-	if cqImpl.UID == cq.UID {
+	if cqImpl != nil && cqImpl.UID == cq.UID {
 		if !cq.DeletionTimestamp.IsZero() {
 			c.terminateClusterQueueLocked(cqImpl)
 		}
-		return nil
+		return cqImpl.replacementPending, nil
 	}
-	if err := c.ensureNoPendingAssumptionsLocked(ctx, cqImpl); err != nil {
-		return err
+	if cqImpl != nil {
+		// Freeze before any fallible work. This retains the old usage on
+		// failure, while ClusterQueueActive and atomic assumptions stop
+		// admitting against it.
+		cqImpl.replacementPending = true
+		cqImpl.reportStatus()
+		if err := c.ensureNoPendingAssumptionsLocked(ctx, cqImpl); err != nil {
+			return true, err
+		}
 	}
 
 	log := ctrl.LoggerFrom(ctx)
-	c.deleteClusterQueueLocked(log, cqImpl, true)
-	return c.addClusterQueueLocked(ctx, cq, true)
+	replacement, queues, workloads, err := c.prepareClusterQueueReplacementLocked(ctx, cq)
+	if err != nil {
+		return true, err
+	}
+
+	if cqImpl != nil {
+		c.deleteClusterQueueLocked(log, cqImpl, true)
+	}
+	replacement.replacementPending = true
+	replacement.metricsSuppressed = false
+	c.hm.AddClusterQueue(replacement)
+	c.hm.UpdateClusterQueueEdge(replacement.Name, cq.Spec.CohortName)
+	if replacement.HasParent() {
+		// The parent was checked for cycles while preparing the replacement.
+		updateCohortTreeResourcesIfNoCycle(replacement.Parent())
+	}
+	for i := range queues {
+		qKey := queueKey(&queues[i])
+		replacement.localQueues[qKey].customLabels.LQStore(qKey, queues[i].Labels, queues[i].Annotations)
+	}
+	for i := range workloads {
+		wlLog := log.WithValues("workload", workload.Key(&workloads[i]))
+		if c.concurrentAdmissionEnabledForWithoutLock(&workloads[i]) && !concurrentadmission.IsVariant(&workloads[i]) {
+			continue
+		}
+		c.workloadAssignedQueues[workload.Key(&workloads[i])] = replacement.Name
+		replacement.addOrUpdateWorkload(wlLog, &workloads[i])
+	}
+	replacement.reportStatus()
+	return true, nil
+}
+
+func (c *Cache) prepareClusterQueueReplacementLocked(
+	ctx context.Context,
+	cq *kueue.ClusterQueue,
+) (*clusterQueue, []kueue.LocalQueue, []kueue.Workload, error) {
+	if cq.Spec.CohortName != "" {
+		if parent := c.hm.Cohort(cq.Spec.CohortName); parent != nil && hierarchy.HasCycle(parent) {
+			return nil, nil, nil, ErrCohortHasCycle
+		}
+	}
+	log := ctrl.LoggerFrom(ctx)
+	replacement, err := c.newDetachedClusterQueue(log, cq)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if !cq.DeletionTimestamp.IsZero() {
+		replacement.Status = terminating
+	}
+
+	var queues kueue.LocalQueueList
+	if err := c.client.List(ctx, &queues, client.MatchingFields{utilindexer.QueueClusterQueueKey: cq.Name}); err != nil {
+		return nil, nil, nil, fmt.Errorf("listing queues that match the clusterQueue: %w", err)
+	}
+	for i := range queues.Items {
+		q := &queues.Items[i]
+		qKey := queueKey(q)
+		replacement.localQueues[qKey] = &LocalQueue{
+			key:               qKey,
+			totalReserved:     make(resources.FlavorResourceQuantities),
+			admittedUsage:     make(resources.FlavorResourceQuantities),
+			labels:            q.GetLabels(),
+			customLabels:      c.customLabels,
+			resourceFormatter: c.resourceFormatter,
+		}
+	}
+
+	var workloads kueue.WorkloadList
+	if err := c.client.List(ctx, &workloads, client.MatchingFields{utilindexer.WorkloadClusterQueueKey: cq.Name}); err != nil {
+		return nil, nil, nil, fmt.Errorf("listing workloads that match the queue: %w", err)
+	}
+	activeWorkloads := make([]kueue.Workload, 0, len(workloads.Items))
+	for i := range workloads.Items {
+		if workload.HasActiveQuotaReservation(&workloads.Items[i]) {
+			activeWorkloads = append(activeWorkloads, workloads.Items[i])
+		}
+	}
+	return replacement, queues.Items, activeWorkloads, nil
+}
+
+// CompleteClusterQueueReplacement makes the new scheduler-cache incarnation
+// visible to admission after the queue manager has completed the same swap.
+func (c *Cache) CompleteClusterQueueReplacement(name kueue.ClusterQueueReference, uid types.UID) bool {
+	c.Lock()
+	defer c.Unlock()
+	cq := c.hm.ClusterQueue(name)
+	if cq == nil || cq.UID != uid {
+		return false
+	}
+	cq.replacementPending = false
+	c.resyncClusterQueueGaugeMetricsLocked(cq)
+	return true
 }
 
 func (c *Cache) ensureNoPendingAssumptionsLocked(ctx context.Context, cq *clusterQueue) error {
@@ -514,29 +627,15 @@ func (c *Cache) ensureNoPendingAssumptionsLocked(ctx context.Context, cq *cluste
 	return nil
 }
 
-func (c *Cache) addClusterQueueLocked(ctx context.Context, cq *kueue.ClusterQueue, cleanupOnError bool) (err error) {
+func (c *Cache) addClusterQueueLocked(ctx context.Context, cq *kueue.ClusterQueue) error {
 	log := ctrl.LoggerFrom(ctx)
 	cqImpl, err := c.newClusterQueue(log, cq)
 	if err != nil {
-		// newClusterQueue installs the hierarchy node before validating all
-		// fields. Retryable ensure operations roll partial nodes back, while
-		// direct Add retains the existing behavior that lets Update repair one.
-		if cleanupOnError {
-			if partial := c.hm.ClusterQueue(kueue.ClusterQueueReference(cq.Name)); partial != nil && partial.UID == cq.UID {
-				c.deleteClusterQueueLocked(log, partial, true)
-			}
-		}
 		return err
 	}
 	if !cq.DeletionTimestamp.IsZero() {
 		c.terminateClusterQueueLocked(cqImpl)
 	}
-	complete := false
-	defer func() {
-		if cleanupOnError && !complete {
-			c.deleteClusterQueueLocked(log, cqImpl, true)
-		}
-	}()
 
 	// On controller restart, an add ClusterQueue event may come after
 	// add queue and workload, so here we explicitly list and add existing queues
@@ -579,7 +678,6 @@ func (c *Cache) addClusterQueueLocked(ctx context.Context, cq *kueue.ClusterQueu
 	parentCohort, rootCohort := cqImpl.parentAndRootCohort()
 	c.recordCQInfo(cqImpl, parentCohort, rootCohort)
 
-	complete = true
 	return nil
 }
 
@@ -616,7 +714,7 @@ func (c *Cache) resyncClusterQueueGaugeMetricsLocked(cq *clusterQueue) {
 	if cq == nil {
 		return
 	}
-	metrics.ReportClusterQueueStatus(cq.Name, cq.Status, cq.GetCustomLabelValues(), c.roleTracker)
+	cq.reportStatus()
 	parentCohort, rootCohort := cq.parentAndRootCohort()
 	c.recordCQInfo(cq, parentCohort, rootCohort)
 	cq.reportActiveWorkloads()
@@ -914,7 +1012,7 @@ func (c *Cache) AddOrUpdateWorkloadForClusterQueueUID(log logr.Logger, w *kueue.
 	if cq.UID != expectedUID {
 		return false, fmt.Errorf("%w: cached %q, expected %q", ErrCqUIDMismatch, cq.UID, expectedUID)
 	}
-	if cq.Status != active {
+	if !cq.Active() {
 		return false, ErrCqNotActive
 	}
 	return c.addOrUpdateWorkloadWithoutLock(log, w)

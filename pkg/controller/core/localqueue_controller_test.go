@@ -1071,11 +1071,14 @@ func TestLocalQueueStatusWaitsForClusterQueueIncarnation(t *testing.T) {
 		t.Fatalf("Published status across ClusterQueue incarnations: %+v", first.Status)
 	}
 
-	if err := cqCache.EnsureClusterQueue(ctx, newCQ); err != nil {
-		t.Fatalf("Replacing ClusterQueue in scheduler cache: %v", err)
+	if pending, err := cqCache.ReplaceClusterQueue(ctx, newCQ); err != nil || !pending {
+		t.Fatalf("Replacing ClusterQueue in scheduler cache: pending=%t, error=%v", pending, err)
 	}
-	if err := qManager.EnsureClusterQueue(ctx, newCQ); err != nil {
+	if err := qManager.ReplaceClusterQueue(ctx, newCQ); err != nil {
 		t.Fatalf("Replacing ClusterQueue in queue manager: %v", err)
+	}
+	if !cqCache.CompleteClusterQueueReplacement(kueue.ClusterQueueReference(newCQ.Name), newCQ.UID) {
+		t.Fatal("Completing ClusterQueue replacement")
 	}
 	if _, err := reconciler.Reconcile(ctx, request); err != nil {
 		t.Fatalf("Second Reconcile() error: %v", err)
@@ -1131,6 +1134,41 @@ func TestStoppedLocalQueueConditionDuringClusterQueueReplacement(t *testing.T) {
 	condition := apimeta.FindStatusCondition(got.Status.Conditions, kueue.LocalQueueActive)
 	if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != StoppedReason {
 		t.Fatalf("Active condition = %v, want False/%s", condition, StoppedReason)
+	}
+}
+
+func TestLocalQueueReportsConditionWhenClusterQueueCacheIsAbsent(t *testing.T) {
+	cq := utiltestingapi.MakeClusterQueue("cq").Obj()
+	cq.UID = "uid"
+	lq := utiltestingapi.MakeLocalQueue("lq", "ns").ClusterQueue(cq.Name).Obj()
+	objects := []client.Object{cq, lq}
+	cl := utiltesting.NewClientBuilder().
+		WithObjects(objects...).
+		WithStatusSubresource(objects...).
+		WithInterceptorFuncs(interceptor.Funcs{SubResourcePatch: utiltesting.TreatSSAAsStrategicMerge}).
+		Build()
+	cqCache := schdcache.New(cl)
+	qManager := qcache.NewManagerForUnitTests(cl, cqCache)
+	ctx, _ := utiltesting.ContextWithLog(t)
+	if err := qManager.AddLocalQueue(ctx, lq); err != nil {
+		t.Fatalf("Adding LocalQueue: %v", err)
+	}
+	reconciler := NewLocalQueueReconciler(cl, qManager, cqCache)
+
+	result, err := reconciler.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(lq)})
+	if err != nil {
+		t.Fatalf("Reconcile() error: %v", err)
+	}
+	if result.RequeueAfter != 0 {
+		t.Fatalf("Reconcile() result = %v, want no requeue", result)
+	}
+	var got kueue.LocalQueue
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(lq), &got); err != nil {
+		t.Fatalf("Getting LocalQueue: %v", err)
+	}
+	condition := apimeta.FindStatusCondition(got.Status.Conditions, kueue.LocalQueueActive)
+	if condition == nil || condition.Status != metav1.ConditionFalse || condition.Reason != clusterQueueIsInactiveReason {
+		t.Fatalf("Active condition = %v, want False/%s", condition, clusterQueueIsInactiveReason)
 	}
 }
 

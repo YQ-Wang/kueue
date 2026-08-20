@@ -219,7 +219,7 @@ func (r *LocalQueueReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	if !stats.ClusterQueueExists || stats.ClusterQueueUID != cq.UID {
+	if stats.ClusterQueueExists && stats.ClusterQueueUID != cq.UID {
 		if stopped {
 			if err := r.applyLocalQueueCondition(ctx, &queueObj, metav1.ConditionFalse, StoppedReason, localQueueIsInactiveMsg); err != nil {
 				return ctrl.Result{}, client.IgnoreNotFound(err)
