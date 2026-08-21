@@ -102,7 +102,7 @@ func TestEntryPenaltyAggregateMatchesRecords(t *testing.T) {
 	}
 	sum := corev1.ResourceList{}
 	for _, p := range entry.penaltyRecords {
-		for k, v := range p {
+		for k, v := range p.resources {
 			q := sum[k]
 			q.Add(v)
 			sum[k] = q

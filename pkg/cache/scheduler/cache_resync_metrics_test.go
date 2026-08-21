@@ -18,17 +18,90 @@ package scheduler
 
 import (
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	ctrl "sigs.k8s.io/controller-runtime"
 
 	configapi "sigs.k8s.io/kueue/apis/config/v1beta2"
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
 	"sigs.k8s.io/kueue/pkg/features"
 	"sigs.k8s.io/kueue/pkg/metrics"
+	"sigs.k8s.io/kueue/pkg/util/queue"
 	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
 	testingmetrics "sigs.k8s.io/kueue/pkg/util/testing/metrics"
 	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
 )
+
+func TestCompleteClusterQueueReplacementPublishesAdmittedMetricsOnce(t *testing.T) {
+	metrics.InitMetricVectors(nil)
+	defer metrics.InitMetricVectors(nil)
+
+	now := time.Now()
+	oldCQ := utiltestingapi.MakeClusterQueue("cq").
+		ResourceGroup(*utiltestingapi.MakeFlavorQuotas("default").Resource(corev1.ResourceCPU, "10").Obj()).
+		Obj()
+	oldCQ.UID = "old"
+	newCQ := oldCQ.DeepCopy()
+	newCQ.UID = "new"
+	lq := utiltestingapi.MakeLocalQueue("lq", "ns").ClusterQueue(oldCQ.Name).Obj()
+	wl := utiltestingapi.MakeWorkload("wl", lq.Namespace).
+		Queue(kueue.LocalQueueName(lq.Name)).
+		Request(corev1.ResourceCPU, "4").
+		SimpleReserveQuota(kueue.ClusterQueueReference(oldCQ.Name), "default", now).
+		AdmittedAt(true, now).
+		Obj()
+	cache := New(
+		utiltesting.NewClientBuilder().WithObjects(newCQ, lq, wl).Build(),
+		WithLocalQueueMetrics(&metrics.LocalQueueMetricsConfig{Enabled: true, QueueSelector: labels.Everything()}),
+	)
+	ctx, _ := utiltesting.ContextWithLog(t)
+	if err := cache.AddClusterQueue(ctx, oldCQ); err != nil {
+		t.Fatalf("Adding old ClusterQueue: %v", err)
+	}
+
+	metricValue := func(t *testing.T) (cqValue, lqValue float64) {
+		t.Helper()
+		for _, point := range testingmetrics.CollectFilteredGaugeVec(metrics.AdmittedActiveWorkloads, map[string]string{"cluster_queue": oldCQ.Name}) {
+			cqValue += point.Value
+		}
+		for _, point := range testingmetrics.CollectFilteredGaugeVec(metrics.LocalQueueAdmittedActiveWorkloads, map[string]string{"namespace": lq.Namespace, "name": lq.Name}) {
+			lqValue += point.Value
+		}
+		return cqValue, lqValue
+	}
+	if cqValue, lqValue := metricValue(t); cqValue != 1 || lqValue != 1 {
+		t.Fatalf("Initial admitted metrics = (cq=%v, lq=%v), want (1, 1)", cqValue, lqValue)
+	}
+
+	if pending, err := cache.ReplaceClusterQueue(ctx, newCQ); err != nil || !pending {
+		t.Fatalf("Replacing ClusterQueue: pending=%t, error=%v", pending, err)
+	}
+	cache.ResyncClusterQueueGaugeMetrics(kueue.ClusterQueueReference(newCQ.Name))
+	cache.ResyncLocalQueueGaugeMetrics(kueue.ClusterQueueReference(newCQ.Name), queue.Key(lq))
+	lqMetricRef := metrics.LocalQueueReference{Name: kueue.LocalQueueName(lq.Name), Namespace: lq.Namespace}
+	metrics.ClearLocalQueueResourceMetrics(lqMetricRef)
+	cache.RecordLocalQueueResourceMetrics(ctrl.LoggerFrom(ctx), kueue.ClusterQueueReference(newCQ.Name), queue.Key(lq))
+	if cqValue, lqValue := metricValue(t); cqValue != 0 || lqValue != 0 {
+		t.Fatalf("Pending replacement published admitted metrics = (cq=%v, lq=%v), want (0, 0)", cqValue, lqValue)
+	}
+	if points := testingmetrics.CollectFilteredGaugeVec(metrics.LocalQueueResourceReservations, map[string]string{"namespace": lq.Namespace, "name": lq.Name}); len(points) != 0 {
+		t.Fatalf("Pending replacement published LocalQueue resource metrics: %+v", points)
+	}
+	if !cache.CompleteClusterQueueReplacement(kueue.ClusterQueueReference(newCQ.Name), newCQ.UID) {
+		t.Fatal("Completing ClusterQueue replacement")
+	}
+	if cqValue, lqValue := metricValue(t); cqValue != 1 || lqValue != 1 {
+		t.Fatalf("Completed replacement admitted metrics = (cq=%v, lq=%v), want (1, 1)", cqValue, lqValue)
+	}
+	if !cache.CompleteClusterQueueReplacement(kueue.ClusterQueueReference(newCQ.Name), newCQ.UID) {
+		t.Fatal("Repeating ClusterQueue replacement completion")
+	}
+	if cqValue, lqValue := metricValue(t); cqValue != 1 || lqValue != 1 {
+		t.Fatalf("Repeated completion admitted metrics = (cq=%v, lq=%v), want (1, 1)", cqValue, lqValue)
+	}
+}
 
 func TestResyncClusterQueueGaugeMetricsUsesUpdatedCustomLabels(t *testing.T) {
 	ctx, log := utiltesting.ContextWithLog(t)

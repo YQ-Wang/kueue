@@ -87,6 +87,7 @@ type clusterQueue struct {
 	admittedWorkloadsCount             int
 	isStopped                          bool
 	replacementPending                 bool
+	replacementTargetUID               types.UID
 	metricsSuppressed                  bool
 	workloadInfoOptions                []workload.InfoOption
 	resourceFormatter                  *resources.ResourceFormatter
@@ -540,6 +541,9 @@ func (c *clusterQueue) deleteWorkload(log logr.Logger, wlKey workload.Reference)
 }
 
 func (c *clusterQueue) reportActiveWorkloads() {
+	if c.metricsSuppressed {
+		return
+	}
 	clVals := c.GetCustomLabelValues()
 	for ancestor := range c.Parent().PathSelfToRoot() {
 		metrics.ReportCohortSubtreeAdmittedActiveWorkloads(ancestor.Name, ancestor.admittedWorkloadsCount, clVals, c.roleTracker)
@@ -548,6 +552,9 @@ func (c *clusterQueue) reportActiveWorkloads() {
 }
 
 func (c *clusterQueue) reportAdmittedActiveWorkloads(wlRef workload.Reference, wl *kueue.Workload, incr int) {
+	if c.metricsSuppressed {
+		return
+	}
 	metrics.ReportAdmittedActiveWorkloads(c.Name, incr, c.getLabelValuesFor(wlRef), c.roleTracker)
 
 	qKey := queue.KeyFromWorkload(wl)
@@ -566,6 +573,9 @@ func (c *clusterQueue) resyncAdmittedActiveWorkloads() {
 }
 
 func (c *clusterQueue) reportResourceMetrics(fairSharingEnabled bool) {
+	if c.metricsSuppressed {
+		return
+	}
 	var cohort kueue.CohortReference
 	if c.HasParent() {
 		cohort = c.Parent().GetName()
@@ -636,7 +646,7 @@ func (c *clusterQueue) updateWorkloadUsage(log logr.Logger, wi *workload.Info, o
 			lq.updateAdmittedUsage(frUsage, op)
 			lq.admittedWorkloads += op.asSignedOne()
 		}
-		if lq.shouldExposeMetrics(c.lqMetrics) {
+		if !c.metricsSuppressed && lq.shouldExposeMetrics(c.lqMetrics) {
 			lq.reportActiveWorkloads(c.roleTracker)
 		}
 	}
@@ -713,7 +723,7 @@ func (c *clusterQueue) addLocalQueue(q *kueue.LocalQueue) error {
 		}
 	}
 	c.localQueues[qKey] = qImpl
-	if c.lqMetrics.ShouldExposeLocalQueueMetrics(q.GetLabels()) {
+	if !c.metricsSuppressed && c.lqMetrics.ShouldExposeLocalQueueMetrics(q.GetLabels()) {
 		qImpl.reportActiveWorkloads(c.roleTracker)
 	}
 	return nil

@@ -201,7 +201,7 @@ func run() int {
 		}
 	}
 
-	cCache := schdcache.New(mgr.GetClient())
+	cCache := schdcache.New(mgr.GetClient(), schdcache.WithAPIReader(mgr.GetAPIReader()))
 
 	// setup inadmissible workload requeuer
 	requeuer := qcache.NewRequeuer()

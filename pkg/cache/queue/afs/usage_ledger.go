@@ -21,6 +21,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	utilmaps "sigs.k8s.io/kueue/pkg/util/maps"
 	utilqueue "sigs.k8s.io/kueue/pkg/util/queue"
@@ -31,6 +32,11 @@ import (
 // It mirrors workload.Reference, which this package cannot import because
 // pkg/workload already imports it.
 type WorkloadReference string
+
+type penaltyRecord struct {
+	workloadUID types.UID
+	resources   corev1.ResourceList
+}
 
 // UsageLedgerEntry holds everything a LocalQueue's fair-sharing usage is computed
 // from, as one consistent unit.
@@ -48,7 +54,7 @@ type UsageLedgerEntry struct {
 	// Workload makes the operations idempotent: re-pushing replaces the
 	// Workload's record, and rollback or deletion subtracts exactly what was
 	// recorded.
-	penaltyRecords map[WorkloadReference]corev1.ResourceList
+	penaltyRecords map[WorkloadReference]penaltyRecord
 	// LastUpdate anchors the decay clock: when Resources was last decayed,
 	// or when the entry was created.
 	LastUpdate time.Time
@@ -70,16 +76,28 @@ func (e UsageLedgerEntry) HasPenaltyRecord(wlKey WorkloadReference) bool {
 	return found
 }
 
+// HasPenaltyRecordForWorkload reports whether the pending record belongs to the
+// expected Workload incarnation. A legacy name-only record with an empty UID
+// remains compatible with any incarnation, matching WithoutPenaltyForWorkload.
+func (e UsageLedgerEntry) HasPenaltyRecordForWorkload(wlKey WorkloadReference, workloadUID types.UID) bool {
+	recorded, found := e.penaltyRecords[wlKey]
+	return found && (recorded.workloadUID == "" || recorded.workloadUID == workloadUID)
+}
+
 // withPenalty sets the Workload's pending penalty, replacing any previous record,
 // and keeps the aggregate in sync. It copies rather than mutates the maps, which
 // are shared with readers that fetched the entry via Get.
 func (e UsageLedgerEntry) withPenalty(wlKey WorkloadReference, penalty corev1.ResourceList) UsageLedgerEntry {
+	return e.withPenaltyForWorkload(wlKey, "", penalty)
+}
+
+func (e UsageLedgerEntry) withPenaltyForWorkload(wlKey WorkloadReference, workloadUID types.UID, penalty corev1.ResourceList) UsageLedgerEntry {
 	e, _ = e.WithoutPenalty(wlKey)
 	records := maps.Clone(e.penaltyRecords)
 	if records == nil {
-		records = make(map[WorkloadReference]corev1.ResourceList, 1)
+		records = make(map[WorkloadReference]penaltyRecord, 1)
 	}
-	records[wlKey] = penalty.DeepCopy()
+	records[wlKey] = penaltyRecord{workloadUID: workloadUID, resources: penalty.DeepCopy()}
 	e.penaltyRecords = records
 	e.pendingPenalty = resource.MergeResourceListKeepSum(e.pendingPenalty, penalty)
 	return e
@@ -90,16 +108,27 @@ func (e UsageLedgerEntry) withPenalty(wlKey WorkloadReference, penalty corev1.Re
 // aggregate only ever accumulates recorded amounts, so the subtraction is exact
 // and needs no clamping. Like withPenalty, it copies the shared maps.
 func (e UsageLedgerEntry) WithoutPenalty(wlKey WorkloadReference) (UsageLedgerEntry, corev1.ResourceList) {
+	return e.withoutPenaltyForWorkload(wlKey, "", false)
+}
+
+// WithoutPenaltyForWorkload removes the Workload's record only when it still
+// belongs to the expected object incarnation. Records made through the legacy
+// name-only API have an empty UID and remain removable for compatibility.
+func (e UsageLedgerEntry) WithoutPenaltyForWorkload(wlKey WorkloadReference, workloadUID types.UID) (UsageLedgerEntry, corev1.ResourceList) {
+	return e.withoutPenaltyForWorkload(wlKey, workloadUID, true)
+}
+
+func (e UsageLedgerEntry) withoutPenaltyForWorkload(wlKey WorkloadReference, workloadUID types.UID, requireUIDMatch bool) (UsageLedgerEntry, corev1.ResourceList) {
 	recorded, found := e.penaltyRecords[wlKey]
-	if !found {
+	if !found || requireUIDMatch && recorded.workloadUID != "" && recorded.workloadUID != workloadUID {
 		return e, nil
 	}
 	records := maps.Clone(e.penaltyRecords)
 	delete(records, wlKey)
 	e.penaltyRecords = records
 
-	negated := make(corev1.ResourceList, len(recorded))
-	for k, v := range recorded {
+	negated := make(corev1.ResourceList, len(recorded.resources))
+	for k, v := range recorded.resources {
 		q := v.DeepCopy()
 		q.Neg()
 		negated[k] = q
@@ -112,7 +141,7 @@ func (e UsageLedgerEntry) WithoutPenalty(wlKey WorkloadReference) (UsageLedgerEn
 		}
 	}
 	e.pendingPenalty = aggregate
-	return e, recorded
+	return e, recorded.resources
 }
 
 // AfsUsageLedger is the per-LocalQueue fair-sharing accounting cache.

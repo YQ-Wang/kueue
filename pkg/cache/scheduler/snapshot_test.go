@@ -30,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/component-base/featuregate"
 
@@ -52,11 +53,16 @@ var snapCmpOpts = cmp.Options{
 	cmpopts.IgnoreUnexported(hierarchy.ClusterQueue[*CohortSnapshot]{}),
 	cmpopts.IgnoreUnexported(hierarchy.Manager[*ClusterQueueSnapshot, *CohortSnapshot]{}),
 	cmpopts.IgnoreFields(metav1.Condition{}, "LastTransitionTime"),
-	cmpopts.IgnoreFields(Snapshot{}, "SimulatorSnapshot"),
+	cmpopts.IgnoreFields(Snapshot{}, "SimulatorSnapshot", "ClusterQueueIncarnationEpoch"),
 }
 
 func TestSnapshot(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
+	inactiveCQ := utiltestingapi.MakeClusterQueue("flavor-nonexistent-cq").
+		ResourceGroup(*utiltestingapi.MakeFlavorQuotas("nonexistent-flavor").
+			Resource(corev1.ResourceCPU, "100").Obj()).
+		Obj()
+	inactiveCQ.UID = "inactive-cq-uid"
 	testCases := map[string]struct {
 		cqs        []*kueue.ClusterQueue
 		cohorts    []*kueue.Cohort
@@ -126,13 +132,11 @@ func TestSnapshot(t *testing.T) {
 		},
 		"inactive clusterQueues": {
 			cqs: []*kueue.ClusterQueue{
-				utiltestingapi.MakeClusterQueue("flavor-nonexistent-cq").
-					ResourceGroup(*utiltestingapi.MakeFlavorQuotas("nonexistent-flavor").
-						Resource(corev1.ResourceCPU, "100").Obj()).
-					Obj(),
+				inactiveCQ,
 			},
 			wantSnapshot: Snapshot{
 				InactiveClusterQueueSets: sets.New[kueue.ClusterQueueReference]("flavor-nonexistent-cq"),
+				InactiveClusterQueueUIDs: map[kueue.ClusterQueueReference]types.UID{"flavor-nonexistent-cq": "inactive-cq-uid"},
 			},
 		},
 		"resourceFlavors": {
@@ -765,6 +769,7 @@ func TestSnapshot(t *testing.T) {
 					},
 				),
 				InactiveClusterQueueSets: sets.New[kueue.ClusterQueueReference]("cq-autocycle", "cq-a", "cq-b"),
+				InactiveClusterQueueUIDs: map[kueue.ClusterQueueReference]types.UID{"cq-autocycle": "", "cq-a": "", "cq-b": ""},
 				ResourceFlavors: map[kueue.ResourceFlavorReference]*kueue.ResourceFlavor{
 					"arm": utiltestingapi.MakeResourceFlavor("arm").Obj(),
 				},
@@ -807,6 +812,7 @@ func TestSnapshot(t *testing.T) {
 					map[kueue.ClusterQueueReference]*ClusterQueueSnapshot{},
 				),
 				InactiveClusterQueueSets: sets.New[kueue.ClusterQueueReference]("tas-cq"),
+				InactiveClusterQueueUIDs: map[kueue.ClusterQueueReference]types.UID{"tas-cq": ""},
 				ResourceFlavors: map[kueue.ResourceFlavorReference]*kueue.ResourceFlavor{
 					"tas-flavor": utiltestingapi.MakeResourceFlavor("tas-flavor").
 						TopologyName("missing-topology").

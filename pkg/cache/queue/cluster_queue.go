@@ -348,9 +348,9 @@ func (c *ClusterQueue) Update(apiCQ *kueue.ClusterQueue) error {
 	return nil
 }
 
-// AddFromLocalQueue pushes all workloads belonging to this queue to
-// the ClusterQueue. If at least one workload is added, returns true,
-// otherwise returns false.
+// AddFromLocalQueue restores all workloads belonging to this queue in the
+// ClusterQueue. It returns true when at least one workload is added to the
+// active heap, and false otherwise.
 func (c *ClusterQueue) AddFromLocalQueue(q *LocalQueue, roleTracker *roletracker.RoleTracker, cl *metrics.CustomLabels) bool {
 	c.rwm.Lock()
 	defer c.rwm.Unlock()
@@ -360,8 +360,16 @@ func (c *ClusterQueue) AddFromLocalQueue(q *LocalQueue, roleTracker *roletracker
 			// Parent Workloads are not pushed onto heap
 			continue
 		}
-		// A workload already tracked as inadmissible stays there; retrying it
-		// is owned by the requeue paths, which respect the backoff time.
+		// Rebuilding a ClusterQueue must not bypass a persisted requeue gate.
+		// Keep workloads whose Requeued condition is false, or whose RequeueAt
+		// is still in the future, out of the active heap until a retry moves them.
+		key := workloadKey(info)
+		if !c.backoffWaitingTimeExpired(info) {
+			if c.workloads.Get(key) == nil {
+				c.workloads.InsertInadmissible(key, info)
+			}
+			continue
+		}
 		if c.workloads.PushActiveIfNotPresent(info) {
 			added = true
 		}

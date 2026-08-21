@@ -105,6 +105,8 @@ var (
 	)
 )
 
+const workloadAssumptionRetryDelay = time.Second
+
 // handleDRAConsumableCapacity processes capacity-based resources for consumable
 // capacity devices and merges them into draResources.
 // On success it returns the updated map and done=false.
@@ -423,6 +425,23 @@ func (r *WorkloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (r
 	}
 
 	log.V(2).Info("Reconcile Workload")
+	cacheUpdated, pending, convergenceErr := r.cache.ConvergeWorkloadAssumption(ctx, log, wlKey)
+	if convergenceErr != nil {
+		return ctrl.Result{}, fmt.Errorf("converging scheduler cache assumption: %w", convergenceErr)
+	}
+	if pending {
+		// A Workload event may arrive while the admission patch is still in
+		// flight, or an uncached verification may temporarily disagree with the
+		// listener observation. Keep one retry owned by the controller workqueue
+		// instead of relying on another watch event to clear the assumption.
+		return ctrl.Result{RequeueAfter: workloadAssumptionRetryDelay}, nil
+	}
+	if cacheUpdated {
+		// Update-event AFS settlement is deferred with a coalesced assumption so
+		// it reads the converged admitted usage (for example, ReclaimablePods)
+		// rather than the scheduler's assumed state.
+		r.settleAfsPenaltyIfNeeded(log, &wl)
+	}
 
 	if isOrphanedWorkload(&wl) {
 		err := workload.FinalizeOrphanedWorkload(ctx, r.client, r.clock, &wl, true)
@@ -1293,7 +1312,7 @@ func (r *WorkloadReconciler) Delete(e event.TypedDeleteEvent[*kueue.Workload]) b
 		// A Workload deleted before settling (e.g. a Job deleted while waiting
 		// for an AdmissionCheck) would leave its penalty pending forever,
 		// inflating the LocalQueue's fair-sharing usage until restart.
-		r.queues.AfsUsageLedger.SubPenalty(qutil.KeyFromWorkload(e.Object), queueafs.WorkloadReference(wlKey))
+		r.queues.AfsUsageLedger.SubPenaltyForWorkload(qutil.KeyFromWorkload(e.Object), queueafs.WorkloadReference(wlKey), e.Object.UID)
 	}
 	return true
 }
@@ -1459,8 +1478,8 @@ func (r *WorkloadReconciler) reconcileAfsPenaltiesOnUpdate(
 	// same event was removed from the cache by the event switch and must not be
 	// charged.
 	if active && status == workload.StatusAdmitted && prevStatus != workload.StatusAdmitted &&
-		r.cache.ClusterQueueUsesAdmissionFairSharing(wlCopy.Status.Admission.ClusterQueue) {
-		r.updateAfsConsumedUsage(log, wlCopy)
+		!r.cache.WorkloadAssumptionPending(workload.Key(wlCopy)) {
+		r.settleAfsPenaltyIfNeeded(log, wlCopy)
 	}
 	// Drop a pending penalty its Workload can no longer settle — moved to
 	// another LocalQueue (settlement and deletion key by the current queueName),
@@ -1472,14 +1491,27 @@ func (r *WorkloadReconciler) reconcileAfsPenaltiesOnUpdate(
 	// scheduler assume, and its penalty must still settle.
 	wlRef := queueafs.WorkloadReference(workload.Key(e.ObjectNew))
 	if prevQueue != e.ObjectNew.Spec.QueueName {
-		r.queues.AfsUsageLedger.SubPenalty(qutil.NewLocalQueueReference(e.ObjectOld.Namespace, prevQueue), wlRef)
+		r.queues.AfsUsageLedger.SubPenaltyForWorkload(qutil.NewLocalQueueReference(e.ObjectOld.Namespace, prevQueue), wlRef, e.ObjectOld.UID)
 	}
 	inactiveUnreserved := !active && !workload.HasQuotaReservation(e.ObjectNew)
 	wasActiveOrReserved := workload.IsActive(e.ObjectOld) || workload.HasQuotaReservation(e.ObjectOld)
 	if (inactiveUnreserved && wasActiveOrReserved) ||
 		(status == workload.StatusFinished && prevStatus != workload.StatusFinished) {
-		r.queues.AfsUsageLedger.SubPenalty(qutil.KeyFromWorkload(e.ObjectNew), wlRef)
+		r.queues.AfsUsageLedger.SubPenaltyForWorkload(qutil.KeyFromWorkload(e.ObjectNew), wlRef, e.ObjectNew.UID)
 	}
+}
+
+func (r *WorkloadReconciler) settleAfsPenaltyIfNeeded(log logr.Logger, wl *kueue.Workload) {
+	if !afs.Enabled(r.admissionFSConfig) || !workload.IsActive(wl) || workload.Status(wl) != workload.StatusAdmitted || wl.Status.Admission == nil ||
+		!r.cache.ClusterQueueUsesAdmissionFairSharing(wl.Status.Admission.ClusterQueue) {
+		return
+	}
+	lqKey := qutil.KeyFromWorkload(wl)
+	entry, found := r.queues.AfsUsageLedger.Get(lqKey)
+	if !found || !entry.HasPenaltyRecordForWorkload(queueafs.WorkloadReference(workload.Key(wl)), wl.UID) {
+		return
+	}
+	r.updateAfsConsumedUsage(log, wl)
 }
 
 func (r *WorkloadReconciler) Generic(e event.TypedGenericEvent[*kueue.Workload]) bool {
@@ -1521,7 +1553,7 @@ func (r *WorkloadReconciler) updateAfsConsumedUsage(log logr.Logger, wl *kueue.W
 		// so a repeated settlement folds nothing and other Workloads' pending
 		// penalties are untouched. No record (e.g. pushed before a manager
 		// restart) folds nothing; restart recovery is out of scope.
-		remaining, penalty := old.WithoutPenalty(wlKey)
+		remaining, penalty := old.WithoutPenaltyForWorkload(wlKey, wl.UID)
 		settled = penalty
 		remaining.Resources = resource.MergeResourceListKeepSum(newConsumed, penalty)
 		remaining.LastUpdate = storedLastUpdate

@@ -23,6 +23,7 @@ import (
 	"slices"
 
 	"github.com/go-logr/logr"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -52,9 +53,16 @@ const (
 
 type Snapshot struct {
 	hierarchy.Manager[*ClusterQueueSnapshot, *CohortSnapshot]
-	ResourceFlavors          map[kueue.ResourceFlavorReference]*kueue.ResourceFlavor
-	InactiveClusterQueueSets sets.Set[kueue.ClusterQueueReference]
-	SimulatorSnapshot        simulator.SimulatorSnapshot
+	ResourceFlavors              map[kueue.ResourceFlavorReference]*kueue.ResourceFlavor
+	InactiveClusterQueueSets     sets.Set[kueue.ClusterQueueReference]
+	InactiveClusterQueueUIDs     map[kueue.ClusterQueueReference]types.UID
+	ClusterQueueIncarnationEpoch uint64
+	SimulatorSnapshot            simulator.SimulatorSnapshot
+}
+
+func (s *Snapshot) addInactiveClusterQueue(cq *clusterQueue) {
+	s.InactiveClusterQueueSets.Insert(cq.Name)
+	s.InactiveClusterQueueUIDs[cq.Name] = cq.UID
 }
 
 // RemoveWorkload removes a workload from its corresponding ClusterQueue and
@@ -169,6 +177,8 @@ func WithAfsUsageLedger(ledger *queueafs.AfsUsageLedger) SnapshotOption {
 }
 
 func (c *Cache) Snapshot(ctx context.Context, options ...SnapshotOption) (*Snapshot, error) {
+	c.incarnationGate.RLock()
+	defer c.incarnationGate.RUnlock()
 	c.RLock()
 	defer c.RUnlock()
 
@@ -178,9 +188,11 @@ func (c *Cache) Snapshot(ctx context.Context, options ...SnapshotOption) (*Snaps
 	}
 
 	snap := Snapshot{
-		Manager:                  hierarchy.NewManager(newCohortSnapshot),
-		ResourceFlavors:          make(map[kueue.ResourceFlavorReference]*kueue.ResourceFlavor, len(c.resourceFlavors)),
-		InactiveClusterQueueSets: sets.New[kueue.ClusterQueueReference](),
+		Manager:                      hierarchy.NewManager(newCohortSnapshot),
+		ResourceFlavors:              make(map[kueue.ResourceFlavorReference]*kueue.ResourceFlavor, len(c.resourceFlavors)),
+		InactiveClusterQueueSets:     sets.New[kueue.ClusterQueueReference](),
+		InactiveClusterQueueUIDs:     make(map[kueue.ClusterQueueReference]types.UID),
+		ClusterQueueIncarnationEpoch: c.clusterQueueIncarnationEpoch,
 	}
 
 	if features.Enabled(features.TopologyAwareScheduling) {
@@ -207,7 +219,7 @@ func (c *Cache) Snapshot(ctx context.Context, options ...SnapshotOption) (*Snaps
 	for _, cq := range cqNames {
 		if reason := skipInactiveCQReason(cq); reason != "" {
 			log.V(3).Info("Skipping ClusterQueue", "clusterQueue", cq.Name, "reason", reason)
-			snap.InactiveClusterQueueSets.Insert(cq.Name)
+			snap.addInactiveClusterQueue(cq)
 			continue
 		}
 	}

@@ -358,6 +358,7 @@ func main() {
 		}
 		cacheOptions = append(cacheOptions, schdcache.WithSchedulingSimulator(sim))
 	}
+	cacheOptions = append(cacheOptions, schdcache.WithAPIReader(mgr.GetAPIReader()))
 	cCache := schdcache.New(mgr.GetClient(), cacheOptions...)
 
 	// setup inadmissible workload requeuer

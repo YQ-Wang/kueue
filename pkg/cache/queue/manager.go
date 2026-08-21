@@ -334,17 +334,28 @@ func (m *Manager) AddClusterQueue(ctx context.Context, cq *kueue.ClusterQueue) e
 // ReplaceClusterQueue stages the observed ClusterQueue before swapping it into
 // the queue manager.
 func (m *Manager) ReplaceClusterQueue(ctx context.Context, cq *kueue.ClusterQueue) error {
+	_, err := m.EnsureClusterQueueIncarnation(ctx, cq)
+	return err
+}
+
+// EnsureClusterQueueIncarnation stages the observed ClusterQueue before swapping
+// it into the queue manager. It reports whether the cached incarnation changed.
+func (m *Manager) EnsureClusterQueueIncarnation(ctx context.Context, cq *kueue.ClusterQueue) (bool, error) {
 	m.Lock()
 	defer m.Unlock()
 
 	cqImpl := m.hm.ClusterQueue(kueue.ClusterQueueReference(cq.Name))
 	if cqImpl != nil && cqImpl.uid == cq.UID {
-		return nil
+		return false, nil
+	}
+	var previousRoot kueue.CohortReference
+	if cqImpl != nil && cqImpl.HasParent() && !hierarchy.HasCycle(cqImpl.Parent()) {
+		previousRoot = cqImpl.Parent().getRootUnsafe().GetName()
 	}
 
 	var queues kueue.LocalQueueList
 	if err := m.client.List(ctx, &queues, client.MatchingFields{utilindexer.QueueClusterQueueKey: cq.Name}); err != nil {
-		return fmt.Errorf("listing queues pointing to the cluster queue: %w", err)
+		return false, fmt.Errorf("listing queues pointing to the cluster queue: %w", err)
 	}
 
 	var afsUsageLedger *queueafs.AfsUsageLedger
@@ -353,7 +364,7 @@ func (m *Manager) ReplaceClusterQueue(ctx context.Context, cq *kueue.ClusterQueu
 	}
 	replacement, err := newClusterQueue(ctx, m.client, cq, m.customLabels, m.workloadOrdering, m.admissionFairSharingConfig, afsUsageLedger)
 	if err != nil {
-		return err
+		return false, err
 	}
 	addedWorkloads := false
 	stagedQueues := make(map[queue.LocalQueueReference]*LocalQueue, len(queues.Items))
@@ -393,11 +404,21 @@ func (m *Manager) ReplaceClusterQueue(ctx context.Context, cq *kueue.ClusterQueu
 		}
 	}
 	notifyRetryInadmissibleWithoutLock(m, sets.New(replacement.name))
+	var replacementRoot kueue.CohortReference
+	if replacement.HasParent() && !hierarchy.HasCycle(replacement.Parent()) {
+		replacementRoot = replacement.Parent().getRootUnsafe().GetName()
+	}
+	if previousRoot != "" && previousRoot != replacementRoot {
+		// The replacement can release quota from its former cohort tree. Its
+		// siblings there must be retried even though the name now resolves to the
+		// replacement's new tree.
+		m.requeuer.notifyCohort(previousRoot)
+	}
 	m.resyncClusterQueueGaugeMetricsLocked(replacement)
 	if addedWorkloads {
 		m.Broadcast()
 	}
-	return nil
+	return true, nil
 }
 
 func (m *Manager) addClusterQueueLocked(ctx context.Context, cq *kueue.ClusterQueue, resetLastAssignment bool) error {
@@ -548,6 +569,20 @@ func (m *Manager) DeleteClusterQueue(log logr.Logger, cq *kueue.ClusterQueue) bo
 		return false
 	}
 	m.deleteClusterQueueLocked(log, cqImpl)
+	return true
+}
+
+// DeleteClusterQueueForCacheConvergence removes the cached ClusterQueue without
+// a UID check. Callers must serialize both caches and use this only after the
+// scheduler cache reports that it removed the authoritative incarnation or
+// aborted a transition which still retained the old incarnation.
+func (m *Manager) DeleteClusterQueueForCacheConvergence(log logr.Logger, cqName kueue.ClusterQueueReference) bool {
+	m.Lock()
+	defer m.Unlock()
+	cqImpl := m.hm.ClusterQueue(cqName)
+	if cqImpl != nil {
+		m.deleteClusterQueueLocked(log, cqImpl)
+	}
 	return true
 }
 
@@ -861,6 +896,11 @@ func (m *Manager) RequeueWorkload(ctx context.Context, info *workload.Info, reas
 	// Since the client is cached, the only possible error is NotFound.
 	// We should not requeue a workload that is not admissible.
 	if apierrors.IsNotFound(err) || !workload.IsAdmissible(&w) {
+		return false
+	}
+	// Refresh same-incarnation updates, but never let a stale scheduling attempt
+	// turn into a requeue of a same-name replacement Workload.
+	if info.Obj.UID != "" && w.UID != info.Obj.UID {
 		return false
 	}
 

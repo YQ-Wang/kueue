@@ -438,6 +438,178 @@ type reconcileTestCase struct {
 	beforeReconcile           func(context.Context, client.Client, *qcache.Manager)
 }
 
+func TestReconcileRetriesWorkloadAssumptionConvergence(t *testing.T) {
+	now := time.Now()
+	cq := utiltestingapi.MakeClusterQueue("cq").
+		ResourceGroup(*utiltestingapi.MakeFlavorQuotas("default").Resource(corev1.ResourceCPU, "10").Obj()).
+		Active(metav1.ConditionTrue).
+		Obj()
+	cq.UID = "cq-uid"
+	lq := utiltestingapi.MakeLocalQueue("lq", "ns").ClusterQueue(cq.Name).Obj()
+	observedWorkload := utiltestingapi.MakeWorkload("wl", lq.Namespace).
+		UID("workload-uid").
+		Queue(kueue.LocalQueueName(lq.Name)).
+		Request(corev1.ResourceCPU, "4").
+		SimpleReserveQuota(kueue.ClusterQueueReference(cq.Name), "default", now).
+		Obj()
+
+	cl := utiltesting.NewClientBuilder().
+		WithStatusSubresource(&kueue.Workload{}).
+		WithInterceptorFuncs(interceptor.Funcs{SubResourcePatch: utiltesting.TreatSSAAsStrategicMerge}).
+		Build()
+	transientErr := stderrors.New("transient API read failure")
+	apiReadCount := 0
+	apiReader := interceptor.NewClient(cl, interceptor.Funcs{
+		Get: func(ctx context.Context, reader client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if _, ok := obj.(*kueue.Workload); ok && key == client.ObjectKeyFromObject(observedWorkload) {
+				apiReadCount++
+				if apiReadCount == 1 {
+					return transientErr
+				}
+			}
+			return reader.Get(ctx, key, obj, opts...)
+		},
+	})
+	cqCache := schdcache.New(cl, schdcache.WithAPIReader(apiReader))
+	qManager := qcache.NewManagerForUnitTests(cl, cqCache)
+	reconciler := NewWorkloadReconciler(cl, qManager, cqCache, &utiltesting.EventRecorder{})
+	ctx, log := utiltesting.ContextWithLog(t)
+
+	if err := cl.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: lq.Namespace}}); err != nil {
+		t.Fatalf("Creating Namespace: %v", err)
+	}
+	cqCache.AddOrUpdateResourceFlavor(log, utiltestingapi.MakeResourceFlavor("default").Obj())
+	setupClusterQueue(ctx, t, cl, qManager, cqCache, cq, false)
+	setupLocalQueue(ctx, t, cl, qManager, lq, false)
+	if err := cl.Create(ctx, observedWorkload); err != nil {
+		t.Fatalf("Creating Workload: %v", err)
+	}
+	assumedWorkload := observedWorkload.DeepCopy()
+	if added, err := cqCache.AddOrUpdateWorkloadForClusterQueueUID(log, assumedWorkload, cq.UID); err != nil || !added {
+		t.Fatalf("Adding assumed Workload: added=%t, error=%v", added, err)
+	}
+	wlKey := workload.Key(assumedWorkload)
+	if !cqCache.MarkWorkloadAssumptionPersisted(log, wlKey, assumedWorkload.UID, "persisted-before-observation") {
+		t.Fatal("Marking Workload assumption persisted")
+	}
+
+	if cqCache.AddOrUpdateWorkload(log, observedWorkload.DeepCopy()) {
+		t.Fatal("Coalesced listener observation unexpectedly bypassed API verification")
+	}
+	if apiReadCount != 0 {
+		t.Fatalf("API read count in listener path = %d, want 0", apiReadCount)
+	}
+	request := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(observedWorkload)}
+	if _, err := reconciler.Reconcile(ctx, request); !stderrors.Is(err, transientErr) {
+		t.Fatalf("First Reconcile() error = %v, want %v", err, transientErr)
+	}
+	if _, err := reconciler.Reconcile(ctx, request); err != nil {
+		t.Fatalf("Second Reconcile() error = %v, want nil", err)
+	}
+	if apiReadCount != 2 {
+		t.Fatalf("API read count after Reconcile = %d, want 2", apiReadCount)
+	}
+	if _, pending, err := cqCache.ConvergeWorkloadAssumption(ctx, log, wlKey); err != nil || pending {
+		t.Fatalf("Workload assumption after Reconcile: pending=%t, error=%v, want false, nil", pending, err)
+	}
+}
+
+func TestAfsSettlementWaitsForWorkloadAssumptionConvergence(t *testing.T) {
+	features.SetFeatureGateDuringTest(t, features.AdmissionFairSharing, true)
+	start := time.Now().Truncate(time.Second)
+	fakeClock := testingclock.NewFakeClock(start)
+	afsConfig := &configapi.AdmissionFairSharing{
+		UsageHalfLifeTime:     metav1.Duration{Duration: time.Minute},
+		UsageSamplingInterval: metav1.Duration{Duration: time.Minute},
+	}
+	cq := utiltestingapi.MakeClusterQueue("cq").
+		ResourceGroup(*utiltestingapi.MakeFlavorQuotas("default").Resource(corev1.ResourceCPU, "10").Obj()).
+		AdmissionMode(kueue.UsageBasedAdmissionFairSharing).
+		Active(metav1.ConditionTrue).
+		Obj()
+	cq.UID = "cq-uid"
+	lq := utiltestingapi.MakeLocalQueue("lq", "ns").ClusterQueue(cq.Name).Obj()
+	observedWorkload := utiltestingapi.MakeWorkload("wl", lq.Namespace).
+		UID("workload-uid").
+		Queue(kueue.LocalQueueName(lq.Name)).
+		Request(corev1.ResourceCPU, "4").
+		SimpleReserveQuota(kueue.ClusterQueueReference(cq.Name), "default", start).
+		AdmittedAt(true, start).
+		ReclaimablePods(kueue.ReclaimablePod{Name: kueue.DefaultPodSetName, Count: 1}).
+		Obj()
+
+	cl := utiltesting.NewClientBuilder().
+		WithStatusSubresource(&kueue.Workload{}).
+		WithInterceptorFuncs(interceptor.Funcs{SubResourcePatch: utiltesting.TreatSSAAsStrategicMerge}).
+		Build()
+	cqCache := schdcache.New(cl, schdcache.WithAPIReader(cl), schdcache.WithAdmissionFairSharing(afsConfig))
+	qManager := qcache.NewManagerForUnitTests(cl, cqCache, qcache.WithAdmissionFairSharing(afsConfig))
+	reconciler := NewWorkloadReconciler(cl, qManager, cqCache, &utiltesting.EventRecorder{}, WithAdmissionFairSharing(afsConfig))
+	reconciler.clock = fakeClock
+	ctx, log := utiltesting.ContextWithLog(t)
+
+	if err := cl.Create(ctx, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: lq.Namespace}}); err != nil {
+		t.Fatalf("Creating Namespace: %v", err)
+	}
+	cqCache.AddOrUpdateResourceFlavor(log, utiltestingapi.MakeResourceFlavor("default").Obj())
+	setupClusterQueue(ctx, t, cl, qManager, cqCache, cq, false)
+	setupLocalQueue(ctx, t, cl, qManager, lq, false)
+	if err := cqCache.AddLocalQueue(lq); err != nil {
+		t.Fatalf("Adding LocalQueue to scheduler cache: %v", err)
+	}
+	if err := cl.Create(ctx, observedWorkload); err != nil {
+		t.Fatalf("Creating Workload: %v", err)
+	}
+
+	// The scheduler assumed the Workload before the job controller's reclaimable
+	// update was coalesced into the first Admitted listener observation.
+	assumedWorkload := observedWorkload.DeepCopy()
+	assumedWorkload.Status.ReclaimablePods = nil
+	if added, err := cqCache.AddOrUpdateWorkloadForClusterQueueUID(log, assumedWorkload, cq.UID); err != nil || !added {
+		t.Fatalf("Adding assumed Workload: added=%t, error=%v", added, err)
+	}
+	wlKey := workload.Key(assumedWorkload)
+	if !cqCache.MarkWorkloadAssumptionPersisted(log, wlKey, assumedWorkload.UID, "persisted-before-observation") {
+		t.Fatal("Marking Workload assumption persisted")
+	}
+	lqKey := utilqueue.Key(lq)
+	penalty := afs.CalculateEntryPenalty(workload.NewInfo(assumedWorkload).SumTotalRequests(reconciler.resourceFormatter), afsConfig)
+	qManager.AfsUsageLedger.PushPenaltyForWorkload(lqKey, queueafs.WorkloadReference(wlKey), assumedWorkload.UID, penalty, start)
+	fakeClock.Step(time.Minute)
+
+	quotaReservedWorkload := observedWorkload.DeepCopy()
+	quotaReservedWorkload.Status.ReclaimablePods = nil
+	apimeta.RemoveStatusCondition(&quotaReservedWorkload.Status.Conditions, kueue.WorkloadAdmitted)
+	reconciler.Update(event.TypedUpdateEvent[*kueue.Workload]{
+		ObjectOld: quotaReservedWorkload,
+		ObjectNew: observedWorkload.DeepCopy(),
+	})
+	if !qManager.AfsUsageLedger.HasPendingPenalty(lqKey) {
+		t.Fatal("Admitted update settled the penalty before cache assumption convergence")
+	}
+	if entry, found := qManager.AfsUsageLedger.Get(lqKey); !found {
+		t.Fatal("AFS usage entry missing before convergence")
+	} else if cpu := entry.Resources[corev1.ResourceCPU]; !cpu.IsZero() {
+		t.Fatalf("Consumed CPU before convergence = %s, want 0", cpu.String())
+	}
+
+	request := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(observedWorkload)}
+	if _, err := reconciler.Reconcile(ctx, request); err != nil {
+		t.Fatalf("Reconcile() error = %v, want nil", err)
+	}
+	if qManager.AfsUsageLedger.HasPendingPenalty(lqKey) {
+		t.Fatal("Penalty remained pending after cache assumption convergence")
+	}
+	entry, found := qManager.AfsUsageLedger.Get(lqKey)
+	if !found {
+		t.Fatal("AFS usage entry missing after convergence")
+	}
+	wantCPU := penalty[corev1.ResourceCPU]
+	if gotCPU := entry.Resources[corev1.ResourceCPU]; gotCPU.Cmp(wantCPU) != 0 {
+		t.Fatalf("Consumed CPU after convergence = %s, want penalty-only %s", gotCPU.String(), wantCPU.String())
+	}
+}
+
 func TestUpdateSkipsRequeueForOnHoldWorkload(t *testing.T) {
 	now := time.Now().Truncate(time.Second)
 	fakeClock := testingclock.NewFakeClock(now)

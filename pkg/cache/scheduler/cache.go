@@ -67,6 +67,28 @@ const (
 	terminating = metrics.CQStatusTerminating
 )
 
+// ClusterQueueDeleteResult describes how a ClusterQueue deletion event changed
+// the scheduler cache.
+type ClusterQueueDeleteResult int
+
+const (
+	// ClusterQueueDeleteIgnored indicates that a stale lifecycle event was ignored.
+	ClusterQueueDeleteIgnored ClusterQueueDeleteResult = iota
+	// ClusterQueueDeleteAlreadyAbsent indicates that no scheduler-cache entry existed.
+	ClusterQueueDeleteAlreadyAbsent
+	// ClusterQueueDeleteCurrentDeleted indicates that the current scheduler-cache incarnation was removed.
+	ClusterQueueDeleteCurrentDeleted
+	// ClusterQueueDeleteReplacementAborted indicates that deleting the observed
+	// replacement target removed the frozen old incarnation after preparation failed.
+	ClusterQueueDeleteReplacementAborted
+)
+
+// Deleted reports whether the event left no scheduler-cache ClusterQueue under
+// the requested name.
+func (r ClusterQueueDeleteResult) Deleted() bool {
+	return r != ClusterQueueDeleteIgnored
+}
+
 // Option configures the reconciler.
 type Option func(*Cache)
 
@@ -145,12 +167,28 @@ func WithLocalQueueMetrics(value *metrics.LocalQueueMetricsConfig) Option {
 	}
 }
 
+// WithAPIReader sets the uncached reader used to verify that scheduler
+// assumptions have reached the API server before rebuilding a ClusterQueue.
+func WithAPIReader(apiReader client.Reader) Option {
+	return func(c *Cache) {
+		c.apiReader = apiReader
+	}
+}
+
 // Cache keeps track of the Workloads that got admitted through ClusterQueues.
 type Cache struct {
 	sync.RWMutex
 	podsReadyCond sync.Cond
+	// incarnationGate serializes ClusterQueue incarnation changes with
+	// scheduler operations that have externally visible effects.
+	incarnationGate sync.RWMutex
+	// clusterQueueIncarnationEpoch changes whenever ClusterQueue incarnation,
+	// replacement, or termination visibility changes. It is protected by
+	// incarnationGate and the cache lock.
+	clusterQueueIncarnationEpoch uint64
 
 	client                 client.Client
+	apiReader              client.Reader
 	resourceFlavors        map[kueue.ResourceFlavorReference]*kueue.ResourceFlavor
 	podsReadyTracking      bool
 	admissionChecks        map[kueue.AdmissionCheckReference]AdmissionCheck
@@ -161,6 +199,9 @@ type Cache struct {
 	resourceFormatter      *resources.ResourceFormatter
 	// Tracks Workload's ClusterQueue assignment throughout its presence in the cache, which is when they reserve quota (`QuotaReserved=True`).
 	workloadAssignedQueues map[workload.Reference]kueue.ClusterQueueReference
+	// workloadAssumptions tracks the cache-relevant state installed by the
+	// scheduler until the corresponding API state is observed.
+	workloadAssumptions map[workload.Reference]workloadAssumption
 
 	hm hierarchy.Manager[*clusterQueue, *cohort]
 
@@ -180,6 +221,7 @@ func New(client client.Client, options ...Option) *Cache {
 		resourceFlavors:        make(map[kueue.ResourceFlavorReference]*kueue.ResourceFlavor),
 		admissionChecks:        make(map[kueue.AdmissionCheckReference]AdmissionCheck),
 		workloadAssignedQueues: make(map[workload.Reference]kueue.ClusterQueueReference),
+		workloadAssumptions:    make(map[workload.Reference]workloadAssumption),
 		hm:                     hierarchy.NewManager(newCohort),
 		resourceFormatter:      resourceFormatter,
 		schedulingSimulator:    newDefaultSimulator(),
@@ -190,6 +232,109 @@ func New(client client.Client, options ...Option) *Cache {
 	cache.tasCache = NewTASCache(client, cache.schedulingSimulator, resourceFormatter)
 	cache.podsReadyCond.L = &cache.RWMutex
 	return cache
+}
+
+type workloadAssumption struct {
+	objectKey                types.NamespacedName
+	workloadUID              types.UID
+	clusterQueue             kueue.ClusterQueueReference
+	clusterQueueUID          types.UID
+	persistedResourceVersion string
+	latestObserved           *kueue.Workload
+}
+
+func newWorkloadAssumption(w *kueue.Workload, cqUID types.UID) workloadAssumption {
+	var clusterQueue kueue.ClusterQueueReference
+	if w.Status.Admission != nil {
+		clusterQueue = w.Status.Admission.ClusterQueue
+	}
+	return workloadAssumption{
+		objectKey:       client.ObjectKeyFromObject(w),
+		workloadUID:     w.UID,
+		clusterQueue:    clusterQueue,
+		clusterQueueUID: cqUID,
+	}
+}
+
+func (c *Cache) workloadObservationIsCurrentInAPI(ctx context.Context, observed *kueue.Workload) (bool, error) {
+	if c.apiReader == nil || observed.ResourceVersion == "" {
+		return false, nil
+	}
+	var current kueue.Workload
+	if err := c.apiReader.Get(ctx, client.ObjectKeyFromObject(observed), &current); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return current.UID == observed.UID && current.ResourceVersion == observed.ResourceVersion, nil
+}
+
+func (c *Cache) applyWorkloadAssumptionObservation(log logr.Logger, wlKey workload.Reference, workloadUID types.UID, resourceVersion string) (bool, error) {
+	c.Lock()
+	defer c.Unlock()
+	assumption, found := c.workloadAssumptions[wlKey]
+	if !found || assumption.workloadUID != workloadUID || assumption.persistedResourceVersion == "" ||
+		assumption.latestObserved == nil || assumption.latestObserved.UID != workloadUID ||
+		assumption.latestObserved.ResourceVersion != resourceVersion {
+		return false, nil
+	}
+	updated, err := c.addOrUpdateWorkloadWithoutLock(log, assumption.latestObserved)
+	if err != nil {
+		return false, err
+	}
+	delete(c.workloadAssumptions, wlKey)
+	return updated, nil
+}
+
+// ConvergeWorkloadAssumption verifies a retained listener observation against
+// the uncached API reader and, once they agree, applies it to the scheduler
+// cache. The API read intentionally happens without holding the cache lock.
+//
+// pending is true while an assumption still needs either the admission patch's
+// resource version, a matching listener observation, or a successful API read.
+// Callers that can retry should requeue while pending and propagate err through
+// their rate-limited workqueue rather than relying on another watch event.
+func (c *Cache) ConvergeWorkloadAssumption(ctx context.Context, log logr.Logger, wlKey workload.Reference) (updated, pending bool, err error) {
+	c.RLock()
+	assumption, found := c.workloadAssumptions[wlKey]
+	if !found {
+		c.RUnlock()
+		return false, false, nil
+	}
+	if assumption.persistedResourceVersion == "" || assumption.latestObserved == nil ||
+		assumption.latestObserved.UID != assumption.workloadUID || assumption.latestObserved.ResourceVersion == "" {
+		c.RUnlock()
+		return false, true, nil
+	}
+	observed := assumption.latestObserved.DeepCopy()
+	workloadUID := assumption.workloadUID
+	c.RUnlock()
+
+	observationCurrent, err := c.workloadObservationIsCurrentInAPI(ctx, observed)
+	if err != nil {
+		return false, true, err
+	}
+	if !observationCurrent {
+		return false, true, nil
+	}
+	updated, err = c.applyWorkloadAssumptionObservation(log, wlKey, workloadUID, observed.ResourceVersion)
+	if err != nil {
+		return false, true, err
+	}
+	c.RLock()
+	_, pending = c.workloadAssumptions[wlKey]
+	c.RUnlock()
+	return updated, pending, nil
+}
+
+// WorkloadAssumptionPending reports whether scheduler state for the Workload is
+// still waiting for its API/listener observation barrier.
+func (c *Cache) WorkloadAssumptionPending(wlKey workload.Reference) bool {
+	c.RLock()
+	defer c.RUnlock()
+	_, found := c.workloadAssumptions[wlKey]
+	return found
 }
 
 func (c *Cache) newClusterQueue(log logr.Logger, cq *kueue.ClusterQueue) (*clusterQueue, error) {
@@ -455,11 +600,50 @@ func (c *Cache) clusterQueueInStatus(name kueue.ClusterQueueReference, status me
 }
 
 func (c *Cache) TerminateClusterQueue(name kueue.ClusterQueueReference) {
+	c.incarnationGate.Lock()
+	defer c.incarnationGate.Unlock()
 	c.Lock()
 	defer c.Unlock()
 	if cq := c.hm.ClusterQueue(name); cq != nil {
-		c.terminateClusterQueueLocked(cq)
+		if cq.Status != terminating {
+			c.terminateClusterQueueLocked(cq)
+			c.clusterQueueIncarnationEpoch++
+		}
 	}
+}
+
+func (c *Cache) acquireClusterQueueSnapshotState(name kueue.ClusterQueueReference, epoch uint64, matches func(*clusterQueue) bool) (release func(), ok bool) {
+	c.incarnationGate.RLock()
+	c.RLock()
+	cq := c.hm.ClusterQueue(name)
+	ok = c.clusterQueueIncarnationEpoch == epoch && matches(cq)
+	c.RUnlock()
+	if !ok {
+		c.incarnationGate.RUnlock()
+		return nil, false
+	}
+	return c.incarnationGate.RUnlock, true
+}
+
+// AcquireClusterQueueIncarnation validates that the named incarnation is still
+// installed, the cache-wide incarnation epoch is unchanged, and no replacement is
+// pending. The returned release function holds all ClusterQueue incarnations
+// stable while the caller performs an externally visible operation. Dependency-
+// driven activity changes within the same incarnation are outside this contract.
+func (c *Cache) AcquireClusterQueueIncarnation(name kueue.ClusterQueueReference, uid types.UID, epoch uint64) (release func(), ok bool) {
+	return c.acquireClusterQueueSnapshotState(name, epoch, func(cq *clusterQueue) bool {
+		return cq != nil && cq.UID == uid && !cq.replacementPending
+	})
+}
+
+// AcquireClusterQueueAbsence validates that the named ClusterQueue was absent
+// in the snapshot represented by epoch and remains absent. The returned release
+// function holds all ClusterQueue incarnations stable while the caller performs
+// an externally visible operation.
+func (c *Cache) AcquireClusterQueueAbsence(name kueue.ClusterQueueReference, epoch uint64) (release func(), ok bool) {
+	return c.acquireClusterQueueSnapshotState(name, epoch, func(cq *clusterQueue) bool {
+		return cq == nil
+	})
 }
 
 func (c *Cache) terminateClusterQueueLocked(cq *clusterQueue) {
@@ -481,13 +665,22 @@ func (c *Cache) ClusterQueueEmpty(name kueue.ClusterQueueReference) bool {
 }
 
 func (c *Cache) AddClusterQueue(ctx context.Context, cq *kueue.ClusterQueue) error {
+	c.incarnationGate.Lock()
+	defer c.incarnationGate.Unlock()
 	c.Lock()
 	defer c.Unlock()
 
 	if oldCq := c.hm.ClusterQueue(kueue.ClusterQueueReference(cq.Name)); oldCq != nil {
 		return errors.New("ClusterQueue already exists")
 	}
-	return c.addClusterQueueLocked(ctx, cq)
+	err := c.addClusterQueueLocked(ctx, cq)
+	// addClusterQueueLocked installs the ClusterQueue before rebuilding its
+	// LocalQueues and Workloads. Conservatively invalidate an older snapshot even
+	// if that fallible rebuild returned an error after installation.
+	if c.hm.ClusterQueue(kueue.ClusterQueueReference(cq.Name)) != nil {
+		c.clusterQueueIncarnationEpoch++
+	}
+	return err
 }
 
 // ReplaceClusterQueue stages the observed ClusterQueue before installing it,
@@ -495,13 +688,22 @@ func (c *Cache) AddClusterQueue(ctx context.Context, cq *kueue.ClusterQueue) err
 // completed. It returns whether activation is pending on the queue-manager side
 // of the transition.
 func (c *Cache) ReplaceClusterQueue(ctx context.Context, cq *kueue.ClusterQueue) (bool, error) {
+	c.incarnationGate.Lock()
+	defer c.incarnationGate.Unlock()
 	c.Lock()
 	defer c.Unlock()
+	lifecycleChanged := false
+	defer func() {
+		if lifecycleChanged {
+			c.clusterQueueIncarnationEpoch++
+		}
+	}()
 
 	cqImpl := c.hm.ClusterQueue(kueue.ClusterQueueReference(cq.Name))
 	if cqImpl != nil && cqImpl.UID == cq.UID {
-		if !cq.DeletionTimestamp.IsZero() {
+		if !cq.DeletionTimestamp.IsZero() && cqImpl.Status != terminating {
 			c.terminateClusterQueueLocked(cqImpl)
+			lifecycleChanged = true
 		}
 		return cqImpl.replacementPending, nil
 	}
@@ -509,9 +711,13 @@ func (c *Cache) ReplaceClusterQueue(ctx context.Context, cq *kueue.ClusterQueue)
 		// Freeze before any fallible work. This retains the old usage on
 		// failure, while ClusterQueueActive and atomic assumptions stop
 		// admitting against it.
+		if !cqImpl.replacementPending || cqImpl.replacementTargetUID != cq.UID {
+			lifecycleChanged = true
+		}
 		cqImpl.replacementPending = true
+		cqImpl.replacementTargetUID = cq.UID
 		cqImpl.reportStatus()
-		if err := c.ensureNoPendingAssumptionsLocked(ctx, cqImpl); err != nil {
+		if err := c.ensureNoPendingAssumptionsLocked(cqImpl.Name, cqImpl.UID); err != nil {
 			return true, err
 		}
 	}
@@ -523,11 +729,11 @@ func (c *Cache) ReplaceClusterQueue(ctx context.Context, cq *kueue.ClusterQueue)
 	}
 
 	if cqImpl != nil {
-		c.deleteClusterQueueLocked(log, cqImpl, true)
+		c.deleteClusterQueueLocked(log, cqImpl)
 	}
 	replacement.replacementPending = true
-	replacement.metricsSuppressed = false
 	c.hm.AddClusterQueue(replacement)
+	lifecycleChanged = true
 	c.hm.UpdateClusterQueueEdge(replacement.Name, cq.Spec.CohortName)
 	if replacement.HasParent() {
 		// The parent was checked for cycles while preparing the replacement.
@@ -545,7 +751,6 @@ func (c *Cache) ReplaceClusterQueue(ctx context.Context, cq *kueue.ClusterQueue)
 		c.workloadAssignedQueues[workload.Key(&workloads[i])] = replacement.Name
 		replacement.addOrUpdateWorkload(wlLog, &workloads[i])
 	}
-	replacement.reportStatus()
 	return true, nil
 }
 
@@ -600,28 +805,36 @@ func (c *Cache) prepareClusterQueueReplacementLocked(
 // CompleteClusterQueueReplacement makes the new scheduler-cache incarnation
 // visible to admission after the queue manager has completed the same swap.
 func (c *Cache) CompleteClusterQueueReplacement(name kueue.ClusterQueueReference, uid types.UID) bool {
+	c.incarnationGate.Lock()
+	defer c.incarnationGate.Unlock()
 	c.Lock()
 	defer c.Unlock()
 	cq := c.hm.ClusterQueue(name)
 	if cq == nil || cq.UID != uid {
 		return false
 	}
+	if !cq.replacementPending {
+		return true
+	}
+	// Keep metrics suppressed until both caches have swapped. Publishing once
+	// here avoids exposing a half-completed transition and prevents additive
+	// admitted-active gauges from being counted during both rebuild and resync.
 	cq.replacementPending = false
+	cq.metricsSuppressed = false
 	c.resyncClusterQueueGaugeMetricsLocked(cq)
+	c.clusterQueueIncarnationEpoch++
 	return true
 }
 
-func (c *Cache) ensureNoPendingAssumptionsLocked(ctx context.Context, cq *clusterQueue) error {
-	for _, cachedWorkload := range cq.Workloads {
-		var apiWorkload kueue.Workload
-		if err := c.client.Get(ctx, client.ObjectKeyFromObject(cachedWorkload.Obj), &apiWorkload); err != nil {
-			if apierrors.IsNotFound(err) {
-				continue
-			}
-			return fmt.Errorf("checking workload assumption for %s: %w", workload.Key(cachedWorkload.Obj), err)
-		}
-		if workload.HasActiveQuotaReservation(cachedWorkload.Obj) && !workload.HasActiveQuotaReservation(&apiWorkload) {
-			return fmt.Errorf("%w: workload %s", ErrCqAssumptions, workload.Key(cachedWorkload.Obj))
+// ensureNoPendingAssumptionsLocked rejects replacement while the Workload
+// controller still owns convergence of an assumption. It deliberately performs
+// no API reads: ReplaceClusterQueue holds both the cache lock and the global
+// incarnation write gate, so network I/O here would block every scheduler
+// operation until the API request completed.
+func (c *Cache) ensureNoPendingAssumptionsLocked(cqName kueue.ClusterQueueReference, cqUID types.UID) error {
+	for wlRef, assumption := range c.workloadAssumptions {
+		if assumption.clusterQueue == cqName && assumption.clusterQueueUID == cqUID {
+			return fmt.Errorf("%w: workload %s", ErrCqAssumptions, wlRef)
 		}
 	}
 	return nil
@@ -711,7 +924,7 @@ func (c *Cache) UpdateClusterQueue(log logr.Logger, cq *kueue.ClusterQueue) erro
 }
 
 func (c *Cache) resyncClusterQueueGaugeMetricsLocked(cq *clusterQueue) {
-	if cq == nil {
+	if cq == nil || cq.metricsSuppressed {
 		return
 	}
 	cq.reportStatus()
@@ -734,7 +947,7 @@ func (c *Cache) ResyncClusterQueueGaugeMetrics(cqName kueue.ClusterQueueReferenc
 }
 
 func (c *Cache) resyncLocalQueueGaugeMetricsLocked(cq *clusterQueue, lq *LocalQueue) {
-	if cq == nil || lq == nil || !lq.shouldExposeMetrics(c.lqMetrics) {
+	if cq == nil || cq.metricsSuppressed || lq == nil || !lq.shouldExposeMetrics(c.lqMetrics) {
 		return
 	}
 	lq.reportActiveWorkloads(c.roleTracker)
@@ -774,27 +987,64 @@ func (c *Cache) ResyncCohortGaugeMetrics(log logr.Logger, cohortName kueue.Cohor
 	}
 }
 
-// DeleteClusterQueue removes the cached ClusterQueue when the UID matches.
-// It returns false only when the name is occupied by a different incarnation.
+// DeleteClusterQueue removes the cached ClusterQueue unless the event is stale
+// for the current replacement lifecycle. It returns false for ignored events.
 func (c *Cache) DeleteClusterQueue(cq *kueue.ClusterQueue) bool {
+	return c.DeleteClusterQueueWithResult(cq).Deleted()
+}
+
+// DeleteClusterQueueWithResult additionally identifies deletion of a target
+// incarnation that aborts a failed replacement transition.
+func (c *Cache) DeleteClusterQueueWithResult(cq *kueue.ClusterQueue) ClusterQueueDeleteResult {
+	c.incarnationGate.Lock()
+	defer c.incarnationGate.Unlock()
 	c.Lock()
 	defer c.Unlock()
 	cqName := kueue.ClusterQueueReference(cq.Name)
 	curCq := c.hm.ClusterQueue(cqName)
 	if curCq == nil {
-		return true
+		return ClusterQueueDeleteAlreadyAbsent
 	}
-	// An informer can compact delete/recreate into an Update. Ignore a delayed
-	// delete for the old object if the cache already holds the replacement.
-	if cq.UID != "" && curCq.UID != cq.UID {
-		return false
+	if cq.UID != "" {
+		if curCq.replacementTargetUID != "" {
+			switch cq.UID {
+			case curCq.replacementTargetUID:
+				// Preparation failed before the target incarnation was installed.
+				// Its deletion aborts the transition and removes the frozen old state.
+				c.deleteClusterQueueLocked(logr.Discard(), curCq)
+				c.clusterQueueIncarnationEpoch++
+				return ClusterQueueDeleteReplacementAborted
+			case curCq.UID:
+				// Once a newer incarnation has been observed, a delayed delete for
+				// the old object must not tear down the transition state.
+				return ClusterQueueDeleteIgnored
+			}
+		}
+		// An informer can compact delete/recreate into an Update. Ignore a delayed
+		// delete for the old object if the cache already holds the replacement.
+		if curCq.UID != cq.UID {
+			return ClusterQueueDeleteIgnored
+		}
 	}
-	c.deleteClusterQueueLocked(logr.Discard(), curCq, false)
-	return true
+	c.deleteClusterQueueLocked(logr.Discard(), curCq)
+	c.clusterQueueIncarnationEpoch++
+	return ClusterQueueDeleteCurrentDeleted
 }
 
-func (c *Cache) deleteClusterQueueLocked(log logr.Logger, cq *clusterQueue, forgetWorkloads bool) {
+func (c *Cache) deleteClusterQueueLocked(log logr.Logger, cq *clusterQueue) {
 	cqName := cq.Name
+	for wlRef := range cq.Workloads {
+		cq.forgetWorkload(log, wlRef)
+		delete(c.workloadAssignedQueues, wlRef)
+		delete(c.workloadAssumptions, wlRef)
+	}
+	for wlRef, assumption := range c.workloadAssumptions {
+		if assumption.clusterQueue == cq.Name && assumption.clusterQueueUID == cq.UID {
+			delete(c.workloadAssumptions, wlRef)
+		}
+	}
+	// Forget workloads before clearing LocalQueue metrics so the subtractive
+	// admitted-active updates cannot recreate a cleared series at -1.
 	if c.lqMetrics.IsEnabled() {
 		for _, q := range cq.localQueues {
 			namespace, lqName := queue.MustParseLocalQueueReference(q.key)
@@ -802,13 +1052,6 @@ func (c *Cache) deleteClusterQueueLocked(log logr.Logger, cq *clusterQueue, forg
 				Name:      lqName,
 				Namespace: namespace,
 			})
-		}
-	}
-
-	if forgetWorkloads {
-		for wlRef := range cq.Workloads {
-			cq.forgetWorkload(log, wlRef)
-			delete(c.workloadAssignedQueues, wlRef)
 		}
 	}
 
@@ -826,6 +1069,9 @@ func (c *Cache) deleteClusterQueueLocked(log logr.Logger, cq *clusterQueue, forg
 			parent = updatedParent
 		}
 		c.handleParentUpdate(parent)
+	}
+	if c.podsReadyTracking {
+		c.podsReadyCond.Broadcast()
 	}
 }
 
@@ -986,6 +1232,37 @@ func (c *Cache) concurrentAdmissionEnabledForWithoutLock(wl *kueue.Workload) boo
 
 func (c *Cache) AddOrUpdateWorkload(log logr.Logger, w *kueue.Workload) bool {
 	c.Lock()
+	wlKey := workload.Key(w)
+	if assumption, found := c.workloadAssumptions[wlKey]; found {
+		if assumption.workloadUID != w.UID {
+			// A listener event for the recreated Workload is the observation barrier
+			// for the old incarnation; an API GET of the new UID alone is not.
+			delete(c.workloadAssumptions, wlKey)
+		} else {
+			// Record every same-incarnation listener observation, including one that
+			// is semantically equal to the assumed state. Until the admission patch
+			// returns its resource version, that event could predate the patch.
+			assumption.latestObserved = w.DeepCopy()
+			c.workloadAssumptions[wlKey] = assumption
+			if assumption.persistedResourceVersion == "" || w.ResourceVersion == "" {
+				c.Unlock()
+				return false
+			}
+			c.Unlock()
+			if w.ResourceVersion == assumption.persistedResourceVersion {
+				updated, err := c.applyWorkloadAssumptionObservation(log, wlKey, w.UID, w.ResourceVersion)
+				if err != nil {
+					log.Error(err, "Updating persisted workload assumption in cache")
+					return false
+				}
+				return updated
+			}
+			// A later resource version needs an uncached verification. The event
+			// already enqueues Workload reconciliation, which owns that cancelable,
+			// retryable API read; do not block the informer predicate here.
+			return false
+		}
+	}
 	defer c.Unlock()
 	if c.concurrentAdmissionEnabledForWithoutLock(w) && !concurrentadmission.IsVariant(w) {
 		return false
@@ -995,6 +1272,43 @@ func (c *Cache) AddOrUpdateWorkload(log logr.Logger, w *kueue.Workload) bool {
 		log.Error(err, "Updating workload in cache")
 	}
 	return updated
+}
+
+// MarkWorkloadAssumptionPersisted records the API resource version returned by
+// the scheduler's admission patch. A listener event for that exact version, or
+// a coalesced later observation verified with the uncached API reader, releases
+// the assumption. If that event arrived before the patch call returned, process
+// the retained observation here.
+func (c *Cache) MarkWorkloadAssumptionPersisted(log logr.Logger, wlKey workload.Reference, workloadUID types.UID, resourceVersion string) bool {
+	if resourceVersion == "" {
+		return false
+	}
+	c.Lock()
+	assumption, found := c.workloadAssumptions[wlKey]
+	if !found || assumption.workloadUID != workloadUID {
+		c.Unlock()
+		return false
+	}
+	assumption.persistedResourceVersion = resourceVersion
+	c.workloadAssumptions[wlKey] = assumption
+	if assumption.latestObserved == nil || assumption.latestObserved.UID != workloadUID ||
+		assumption.latestObserved.ResourceVersion == "" {
+		c.Unlock()
+		return true
+	}
+	observedResourceVersion := assumption.latestObserved.ResourceVersion
+	c.Unlock()
+	if observedResourceVersion == resourceVersion {
+		if _, err := c.applyWorkloadAssumptionObservation(log, wlKey, workloadUID, observedResourceVersion); err != nil {
+			log.Error(err, "Updating persisted workload assumption in cache")
+			return false
+		}
+		return true
+	}
+	// A retained observation with a different resource version needs an
+	// uncached verification. Its Workload event already enqueued reconciliation,
+	// so leave convergence to that controller-owned retry path.
+	return true
 }
 
 // AddOrUpdateWorkloadForClusterQueueUID adds a workload only if the referenced
@@ -1015,7 +1329,12 @@ func (c *Cache) AddOrUpdateWorkloadForClusterQueueUID(log logr.Logger, w *kueue.
 	if !cq.Active() {
 		return false, ErrCqNotActive
 	}
-	return c.addOrUpdateWorkloadWithoutLock(log, w)
+	updated, err := c.addOrUpdateWorkloadWithoutLock(log, w)
+	if err != nil || !updated {
+		return updated, err
+	}
+	c.workloadAssumptions[workload.Key(w)] = newWorkloadAssumption(w, expectedUID)
+	return true, nil
 }
 
 func (c *Cache) addOrUpdateWorkloadWithoutLock(log logr.Logger, wl *kueue.Workload) (bool, error) {
@@ -1062,15 +1381,56 @@ func (c *Cache) deleteFromQueueIfPresent(log logr.Logger, wlKey workload.Referen
 func (c *Cache) DeleteWorkload(log logr.Logger, wlKey workload.Reference) error {
 	c.Lock()
 	defer c.Unlock()
+	c.deleteWorkloadLocked(log, wlKey, nil)
+	return nil
+}
 
+// DeleteWorkloadForUID rolls back scheduler state only when it still belongs to
+// the expected Workload incarnation. This prevents an asynchronous admission
+// failure for a deleted Workload from deleting a same-name replacement.
+func (c *Cache) DeleteWorkloadForUID(log logr.Logger, wlKey workload.Reference, expectedUID types.UID) bool {
+	c.Lock()
+	defer c.Unlock()
+	return c.deleteWorkloadLocked(log, wlKey, &expectedUID)
+}
+
+func (c *Cache) deleteWorkloadLocked(log logr.Logger, wlKey workload.Reference, expectedUID *types.UID) bool {
+	assumption, assumed := c.workloadAssumptions[wlKey]
 	cqName, assigned := c.workloadAssignedQueues[wlKey]
+	var cq *clusterQueue
+	var cachedWorkload *workload.Info
+	if assigned {
+		cq = c.hm.ClusterQueue(cqName)
+		if cq != nil {
+			cachedWorkload = cq.Workloads[wlKey]
+		}
+	}
+	if expectedUID != nil {
+		assumptionMatches := assumed && assumption.workloadUID == *expectedUID
+		workloadMatches := cachedWorkload != nil && cachedWorkload.Obj.UID == *expectedUID
+		if !assumptionMatches && !workloadMatches {
+			return false
+		}
+		// If either half of the cache now belongs to a different incarnation,
+		// leave all state intact rather than partially deleting the replacement.
+		if assumed && !assumptionMatches || cachedWorkload != nil && !workloadMatches {
+			return false
+		}
+	}
+	delete(c.workloadAssumptions, wlKey)
 	if !assigned {
-		return nil
+		if assumed && c.podsReadyTracking {
+			c.podsReadyCond.Broadcast()
+		}
+		return assumed
 	}
 
-	cq := c.hm.ClusterQueue(cqName)
 	if cq == nil {
-		return ErrCqNotFound
+		delete(c.workloadAssignedQueues, wlKey)
+		if c.podsReadyTracking {
+			c.podsReadyCond.Broadcast()
+		}
+		return true
 	}
 
 	cq.forgetWorkload(log, wlKey)
@@ -1080,7 +1440,7 @@ func (c *Cache) DeleteWorkload(log logr.Logger, wlKey workload.Reference) error 
 		c.podsReadyCond.Broadcast()
 	}
 
-	return nil
+	return true
 }
 
 func (c *Cache) IsAdded(w workload.Info) bool {

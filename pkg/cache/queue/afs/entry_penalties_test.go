@@ -190,3 +190,26 @@ func TestSubPenaltyDoesNotCreateEntry(t *testing.T) {
 		t.Errorf("pending CPU = %dm, want 2000m", got.MilliValue())
 	}
 }
+
+func TestWorkloadUIDPreventsOldRollbackFromRemovingReplacementPenalty(t *testing.T) {
+	lqKey := utilqueue.NewLocalQueueReference("ns", "lq")
+	wlKey := WorkloadReference("ns/wl")
+	now := time.Now()
+	ledger := NewAfsUsageLedger()
+
+	ledger.PushPenaltyForWorkload(lqKey, wlKey, "old-uid", corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")}, now)
+	// Model W2 being assumed after W1 was removed from the scheduler cache but
+	// before W1's asynchronous admission routine rolls its penalty back.
+	ledger.PushPenaltyForWorkload(lqKey, wlKey, "new-uid", corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("2")}, now)
+	if removed := ledger.SubPenaltyForWorkload(lqKey, wlKey, "old-uid"); removed != nil {
+		t.Fatalf("Old Workload rollback removed replacement penalty: %v", removed)
+	}
+	if got := ledger.PeekPenalty(lqKey)[corev1.ResourceCPU]; got.MilliValue() != 2_000 {
+		t.Fatalf("Replacement penalty after old rollback = %dm, want 2000m", got.MilliValue())
+	}
+	removed := ledger.SubPenaltyForWorkload(lqKey, wlKey, "new-uid")
+	removedCPU := removed[corev1.ResourceCPU]
+	if removedCPU.MilliValue() != 2_000 {
+		t.Fatalf("Replacement rollback removed %v, want 2 CPU", removed)
+	}
+}

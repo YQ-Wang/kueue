@@ -232,15 +232,23 @@ func TestReplaceClusterQueueReplacesIncarnation(t *testing.T) {
 	if err := manager.UpdateClusterQueue(ctx, newCQ, false); !errors.Is(err, ErrClusterQueueUIDMismatch) {
 		t.Fatalf("UpdateClusterQueue() error = %v, want %v", err, ErrClusterQueueUIDMismatch)
 	}
-	if err := manager.ReplaceClusterQueue(ctx, oldCQ); err != nil {
+	changed, err := manager.EnsureClusterQueueIncarnation(ctx, oldCQ)
+	if err != nil {
 		t.Fatalf("Replacing same incarnation: %v", err)
+	}
+	if changed {
+		t.Fatal("Ensuring same incarnation reported a change")
 	}
 	if manager.hm.ClusterQueue("cq").trackedInfo(wlKey).LastAssignment == nil {
 		t.Fatal("Same-incarnation ensure cleared LastAssignment")
 	}
 
-	if err := manager.ReplaceClusterQueue(ctx, newCQ); err != nil {
+	changed, err = manager.EnsureClusterQueueIncarnation(ctx, newCQ)
+	if err != nil {
 		t.Fatalf("Replacing ClusterQueue: %v", err)
+	}
+	if !changed {
+		t.Fatal("Replacing a different incarnation did not report a change")
 	}
 	replacement := manager.hm.ClusterQueue("cq")
 	if replacement == nil || replacement.uid != newCQ.UID {
@@ -260,6 +268,144 @@ func TestReplaceClusterQueueReplacesIncarnation(t *testing.T) {
 	manager.DeleteClusterQueue(log, oldCQ)
 	if got := manager.hm.ClusterQueue("cq"); got == nil || got.uid != newCQ.UID {
 		t.Fatalf("Stale delete removed replacement: %#v", got)
+	}
+}
+
+func TestReplaceClusterQueuePreservesPersistedRequeueGates(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	ctx, log := utiltesting.ContextWithLog(t)
+	lq := utiltestingapi.MakeLocalQueue("lq", "ns").ClusterQueue("cq").Obj()
+	cl := utiltesting.NewFakeClient(lq)
+	manager := NewManagerForUnitTests(cl, nil,
+		WithClock(testingclock.NewFakeClock(now)),
+		WithPreemptionExpectations(preemptexpectations.New()),
+	)
+
+	oldCQ := utiltestingapi.MakeClusterQueue("cq").Obj()
+	oldCQ.UID = "old"
+	newCQ := oldCQ.DeepCopy()
+	newCQ.UID = "new"
+	if err := manager.AddClusterQueue(ctx, oldCQ); err != nil {
+		t.Fatalf("Adding old ClusterQueue: %v", err)
+	}
+	if err := manager.AddLocalQueue(ctx, lq); err != nil {
+		t.Fatalf("Adding LocalQueue: %v", err)
+	}
+
+	count := int32(1)
+	requeueAt := metav1.NewTime(now.Add(time.Hour))
+	workloads := []*kueue.Workload{
+		utiltestingapi.MakeWorkload("ready", lq.Namespace).Queue(kueue.LocalQueueName(lq.Name)).Obj(),
+		utiltestingapi.MakeWorkload("requeued-false", lq.Namespace).Queue(kueue.LocalQueueName(lq.Name)).
+			Condition(metav1.Condition{Type: kueue.WorkloadRequeued, Status: metav1.ConditionFalse}).Obj(),
+		utiltestingapi.MakeWorkload("future-requeue", lq.Namespace).Queue(kueue.LocalQueueName(lq.Name)).
+			RequeueState(&count, &requeueAt).Obj(),
+	}
+	for _, wl := range workloads {
+		if err := cl.Create(ctx, wl); err != nil {
+			t.Fatalf("Creating Workload %s: %v", wl.Name, err)
+		}
+		if err := manager.AddOrUpdateWorkload(log, wl); err != nil {
+			t.Fatalf("Adding Workload %s: %v", wl.Name, err)
+		}
+	}
+
+	wantActive := map[kueue.ClusterQueueReference][]workload.Reference{
+		"cq": {"ns/ready"},
+	}
+	wantInadmissible := map[kueue.ClusterQueueReference][]workload.Reference{
+		"cq": {"ns/future-requeue", "ns/requeued-false"},
+	}
+	if diff := cmp.Diff(wantActive, manager.Dump(), cmpDump...); diff != "" {
+		t.Fatalf("Unexpected active workloads before replacement (-want,+got):\n%s", diff)
+	}
+	if diff := cmp.Diff(wantInadmissible, manager.DumpInadmissible(), cmpDump...); diff != "" {
+		t.Fatalf("Unexpected inadmissible workloads before replacement (-want,+got):\n%s", diff)
+	}
+
+	if err := manager.ReplaceClusterQueue(ctx, newCQ); err != nil {
+		t.Fatalf("Replacing ClusterQueue: %v", err)
+	}
+	if diff := cmp.Diff(wantActive, manager.Dump(), cmpDump...); diff != "" {
+		t.Errorf("Unexpected active workloads after replacement (-want,+got):\n%s", diff)
+	}
+	if diff := cmp.Diff(wantInadmissible, manager.DumpInadmissible(), cmpDump...); diff != "" {
+		t.Errorf("Unexpected inadmissible workloads after replacement (-want,+got):\n%s", diff)
+	}
+}
+
+func TestReplaceClusterQueueNotifiesFormerAndCurrentCohortRoots(t *testing.T) {
+	ctx, _ := utiltesting.ContextWithLog(t)
+	namespace := utiltesting.MakeNamespace("ns")
+	oldLQ := utiltestingapi.MakeLocalQueue("old-lq", namespace.Name).ClusterQueue("old-sibling").Obj()
+	newLQ := utiltestingapi.MakeLocalQueue("new-lq", namespace.Name).ClusterQueue("new-sibling").Obj()
+	oldWorkload := utiltestingapi.MakeWorkload("old-workload", namespace.Name).Queue(kueue.LocalQueueName(oldLQ.Name)).Obj()
+	newWorkload := utiltestingapi.MakeWorkload("new-workload", namespace.Name).Queue(kueue.LocalQueueName(newLQ.Name)).Obj()
+	cl := utiltesting.NewFakeClient(namespace, oldLQ, newLQ, oldWorkload, newWorkload)
+	manager, requeuer := NewManagerForUnitTestsWithRequeuer(cl, nil)
+
+	for _, cohort := range []*kueue.Cohort{
+		utiltestingapi.MakeCohort("old-root").Obj(),
+		utiltestingapi.MakeCohort("new-root").Obj(),
+	} {
+		manager.AddOrUpdateCohort(ctx, cohort)
+	}
+	oldCQ := utiltestingapi.MakeClusterQueue("moving").Cohort("old-root").Obj()
+	oldCQ.UID = "old"
+	for _, cq := range []*kueue.ClusterQueue{
+		oldCQ,
+		utiltestingapi.MakeClusterQueue("old-sibling").Cohort("old-root").Obj(),
+		utiltestingapi.MakeClusterQueue("new-sibling").Cohort("new-root").Obj(),
+	} {
+		if err := manager.AddClusterQueue(ctx, cq); err != nil {
+			t.Fatalf("Adding ClusterQueue %s: %v", cq.Name, err)
+		}
+	}
+	for _, lq := range []*kueue.LocalQueue{oldLQ, newLQ} {
+		if err := manager.AddLocalQueue(ctx, lq); err != nil {
+			t.Fatalf("Adding LocalQueue %s: %v", lq.Name, err)
+		}
+	}
+	// Discard setup notifications before arranging deterministic inadmissible
+	// workloads in each affected tree.
+	requeuer.cqs.Clear()
+	requeuer.cohorts.Clear()
+	for cqName, wl := range map[kueue.ClusterQueueReference]*kueue.Workload{
+		"old-sibling": oldWorkload,
+		"new-sibling": newWorkload,
+	} {
+		cq := manager.hm.ClusterQueue(cqName)
+		key := workload.Key(wl)
+		info := cq.workloads.GetActive(key)
+		if info == nil {
+			t.Fatalf("Workload %s is not active in ClusterQueue %s", key, cqName)
+		}
+		cq.workloads.RemoveActive(key)
+		cq.workloads.InsertInadmissible(key, info)
+	}
+
+	newCQ := oldCQ.DeepCopy()
+	newCQ.UID = "new"
+	newCQ.Spec.CohortName = "new-root"
+	if err := manager.ReplaceClusterQueue(ctx, newCQ); err != nil {
+		t.Fatalf("Replacing ClusterQueue: %v", err)
+	}
+	wantNotifiedRoots := sets.New[kueue.CohortReference]("old-root", "new-root")
+	if diff := cmp.Diff(wantNotifiedRoots, requeuer.cohorts); diff != "" {
+		t.Fatalf("Unexpected cohort-root notifications (-want,+got):\n%s", diff)
+	}
+	if moved := requeuer.ProcessRequeues(ctx); moved != 2 {
+		t.Fatalf("Moved workloads = %d, want 2", moved)
+	}
+	wantActive := map[kueue.ClusterQueueReference][]workload.Reference{
+		"old-sibling": {workload.Key(oldWorkload)},
+		"new-sibling": {workload.Key(newWorkload)},
+	}
+	if diff := cmp.Diff(wantActive, manager.Dump(), cmpDump...); diff != "" {
+		t.Errorf("Unexpected active workloads after processing notifications (-want,+got):\n%s", diff)
+	}
+	if got := manager.DumpInadmissible(); got != nil {
+		t.Errorf("Inadmissible workloads after processing notifications = %v, want none", got)
 	}
 }
 

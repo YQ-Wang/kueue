@@ -30,7 +30,7 @@ func (c *Cache) RecordLocalQueueResourceMetrics(log logr.Logger, cqName kueue.Cl
 	defer c.RUnlock()
 
 	cq := c.hm.ClusterQueue(cqName)
-	if cq == nil {
+	if cq == nil || cq.metricsSuppressed {
 		return
 	}
 

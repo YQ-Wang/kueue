@@ -18,6 +18,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	utilqueue "sigs.k8s.io/kueue/pkg/util/queue"
 )
@@ -28,11 +29,21 @@ import (
 // the first decay elapses from the push rather than from the zero time; such an
 // entry carries StatusAccounted=false so the persisted status is still merged.
 func (a *AfsUsageLedger) PushPenalty(lqKey utilqueue.LocalQueueReference, wlKey WorkloadReference, penalty corev1.ResourceList, now time.Time) {
+	a.pushPenaltyForWorkload(lqKey, wlKey, "", penalty, now)
+}
+
+// PushPenaltyForWorkload records a pending penalty together with the Workload
+// UID, so rollback for an older same-name object cannot remove its replacement.
+func (a *AfsUsageLedger) PushPenaltyForWorkload(lqKey utilqueue.LocalQueueReference, wlKey WorkloadReference, workloadUID types.UID, penalty corev1.ResourceList, now time.Time) {
+	a.pushPenaltyForWorkload(lqKey, wlKey, workloadUID, penalty, now)
+}
+
+func (a *AfsUsageLedger) pushPenaltyForWorkload(lqKey utilqueue.LocalQueueReference, wlKey WorkloadReference, workloadUID types.UID, penalty corev1.ResourceList, now time.Time) {
 	a.entries.Update(lqKey, func(entry UsageLedgerEntry, found bool) UsageLedgerEntry {
 		if !found {
 			entry.LastUpdate = now
 		}
-		return entry.withPenalty(wlKey, penalty)
+		return entry.withPenaltyForWorkload(wlKey, workloadUID, penalty)
 	})
 }
 
@@ -43,9 +54,23 @@ func (a *AfsUsageLedger) PushPenalty(lqKey utilqueue.LocalQueueReference, wlKey 
 // Workloads, and no entry is materialized for a LocalQueue that has none — the
 // LocalQueue may already be deleted.
 func (a *AfsUsageLedger) SubPenalty(lqKey utilqueue.LocalQueueReference, wlKey WorkloadReference) corev1.ResourceList {
+	return a.subPenaltyForWorkload(lqKey, wlKey, "", false)
+}
+
+// SubPenaltyForWorkload removes a pending penalty only if it still belongs to
+// the expected Workload UID.
+func (a *AfsUsageLedger) SubPenaltyForWorkload(lqKey utilqueue.LocalQueueReference, wlKey WorkloadReference, workloadUID types.UID) corev1.ResourceList {
+	return a.subPenaltyForWorkload(lqKey, wlKey, workloadUID, true)
+}
+
+func (a *AfsUsageLedger) subPenaltyForWorkload(lqKey utilqueue.LocalQueueReference, wlKey WorkloadReference, workloadUID types.UID, requireUIDMatch bool) corev1.ResourceList {
 	var removed corev1.ResourceList
 	a.entries.UpdateIfPresent(lqKey, func(entry UsageLedgerEntry) UsageLedgerEntry {
-		entry, removed = entry.WithoutPenalty(wlKey)
+		if requireUIDMatch {
+			entry, removed = entry.WithoutPenaltyForWorkload(wlKey, workloadUID)
+		} else {
+			entry, removed = entry.WithoutPenalty(wlKey)
+		}
 		return entry
 	})
 	return removed
