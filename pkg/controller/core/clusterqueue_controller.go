@@ -193,10 +193,11 @@ func (r *ClusterQueueReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		defer r.resyncClusterQueueGaugeMetrics(&cqObj)
 	}
 
-	if err := r.repairClusterQueueCachesLocked(ctx, &cqObj); err != nil {
+	cachesChanged, err := r.repairClusterQueueCachesLocked(ctx, &cqObj)
+	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if r.reportResourceMetrics && !labelsUpdated {
+	if cachesChanged && r.reportResourceMetrics && !labelsUpdated {
 		// A previous replacement attempt may have published metrics from the
 		// retained old incarnation before failing. Clear the full dimension set on
 		// successful repair so old-only flavor/resource series cannot survive.
@@ -321,13 +322,13 @@ func (r *ClusterQueueReconciler) notifyWatchers(oldCQ, newCQ *kueue.ClusterQueue
 	}
 }
 
-func (r *ClusterQueueReconciler) repairClusterQueueCaches(ctx context.Context, cq *kueue.ClusterQueue) error {
+func (r *ClusterQueueReconciler) repairClusterQueueCaches(ctx context.Context, cq *kueue.ClusterQueue) (bool, error) {
 	r.cacheMutationMu.Lock()
 	defer r.cacheMutationMu.Unlock()
 
 	current, matches, err := r.currentClusterQueueForEventLocked(ctx, cq)
 	if err != nil || !matches {
-		return err
+		return false, err
 	}
 	return r.repairClusterQueueCachesLocked(ctx, current)
 }
@@ -354,26 +355,30 @@ func (r *ClusterQueueReconciler) currentClusterQueueForEventLocked(ctx context.C
 	return &current, true, nil
 }
 
-func (r *ClusterQueueReconciler) repairClusterQueueCachesLocked(ctx context.Context, current *kueue.ClusterQueue) error {
+// repairClusterQueueCachesLocked returns whether either cache needed repair.
+// Callers use this to avoid clearing and rebuilding metrics on ordinary
+// same-incarnation reconciles.
+func (r *ClusterQueueReconciler) repairClusterQueueCachesLocked(ctx context.Context, current *kueue.ClusterQueue) (bool, error) {
 	pending, err := r.cache.ReplaceClusterQueue(ctx, current)
 	if err != nil {
-		return fmt.Errorf("replacing ClusterQueue in scheduler cache: %w", err)
+		return false, fmt.Errorf("replacing ClusterQueue in scheduler cache: %w", err)
 	}
 	qManagerChanged, err := r.qManager.EnsureClusterQueueIncarnation(ctx, current)
 	if err != nil {
-		return fmt.Errorf("replacing ClusterQueue in queue manager: %w", err)
+		return false, fmt.Errorf("replacing ClusterQueue in queue manager: %w", err)
 	}
 	if pending {
 		if !r.cache.CompleteClusterQueueReplacement(kueue.ClusterQueueReference(current.Name), current.UID) {
-			return schdcache.ErrCqNotFound
+			return false, schdcache.ErrCqNotFound
 		}
 	}
-	if pending || qManagerChanged {
+	changed := pending || qManagerChanged
+	if changed {
 		// Do not wake Heads for ordinary same-incarnation reconciles. A wake is
 		// needed only when scheduler visibility or queue-manager contents changed.
 		r.qManager.WakeUp()
 	}
-	return nil
+	return changed, nil
 }
 
 // NotifyResourceFlavorUpdate ignores updates since they have no impact on the ClusterQueue's readiness.
@@ -436,13 +441,14 @@ func (r *ClusterQueueReconciler) Create(e event.TypedCreateEvent[*kueue.ClusterQ
 		labelsUpdated = r.customLabels.CQStore(kueue.ClusterQueueReference(current.GetName()), current.GetLabels(), current.GetAnnotations())
 	}
 
-	if err := r.repairClusterQueueCachesLocked(ctx, current); err != nil {
+	cachesChanged, err := r.repairClusterQueueCachesLocked(ctx, current)
+	if err != nil {
 		log.Error(err, "Failed to initialize ClusterQueue caches")
 	}
 
 	if labelsUpdated {
 		r.resyncClusterQueueGaugeMetrics(current)
-	} else if r.reportResourceMetrics {
+	} else if cachesChanged && r.reportResourceMetrics {
 		// A rapid same-name recreation can make the old Delete event stale and
 		// therefore ineligible to clear name-keyed metrics. Rebuild the complete
 		// resource metric set here so dimensions used only by the old incarnation
@@ -520,11 +526,12 @@ func (r *ClusterQueueReconciler) deleteClusterQueueCachesLocked(log logr.Logger,
 		// the old one while preparing this target. In both cases, any differently
 		// keyed queue-manager entry is stale and must be removed as part of the
 		// same serialized transition.
-		queueDeleted = r.qManager.DeleteClusterQueueForCacheConvergence(log, kueue.ClusterQueueReference(cq.Name))
+		r.qManager.DeleteClusterQueueForCacheConvergence(log, kueue.ClusterQueueReference(cq.Name))
+		queueDeleted = true
 	case schdcache.ClusterQueueDeleteAlreadyAbsent:
 		// The scheduler cache has no transition context to authorize deleting a
 		// different UID; retain the queue manager's ordinary UID guard.
-		queueDeleted = r.qManager.DeleteClusterQueue(log, cq)
+		queueDeleted = r.qManager.DeleteClusterQueueIfUIDMatches(log, cq)
 	case schdcache.ClusterQueueDeleteIgnored:
 		// In particular, don't let Delete(U1) remove qManager's U1 while the
 		// scheduler cache has frozen it as part of a U1 -> U2 transition.
@@ -536,7 +543,6 @@ func (r *ClusterQueueReconciler) deleteClusterQueueCachesLocked(log logr.Logger,
 		return
 	}
 
-	r.cache.ClearCohortMetrics(log, cq.Spec.CohortName)
 	metrics.ClearClusterQueueResourceMetrics(cq.Name)
 	if features.Enabled(features.CustomMetricLabels) {
 		r.customLabels.CQDelete(kueue.ClusterQueueReference(cq.GetName()))
@@ -574,8 +580,11 @@ func (r *ClusterQueueReconciler) Update(e event.TypedUpdateEvent[*kueue.ClusterQ
 		)
 	}
 
+	var cachesChanged bool
 	if incarnationChanged {
-		if err := r.repairClusterQueueCachesLocked(ctx, current); err != nil {
+		var err error
+		cachesChanged, err = r.repairClusterQueueCachesLocked(ctx, current)
+		if err != nil {
 			log.Error(err, "Failed to replace ClusterQueue caches")
 		}
 	} else {
@@ -594,7 +603,14 @@ func (r *ClusterQueueReconciler) Update(e event.TypedUpdateEvent[*kueue.ClusterQ
 	}
 
 	if r.reportResourceMetrics && !labelsUpdated {
-		r.updateResourceMetrics(log, e.ObjectOld, current)
+		if incarnationChanged {
+			if cachesChanged {
+				metrics.ClearClusterQueueResourceMetrics(current.Name)
+				r.cache.RecordClusterQueueResourceMetrics(log, kueue.ClusterQueueReference(current.Name))
+			}
+		} else if specUpdated {
+			r.updateResourceMetrics(log, e.ObjectOld, current)
+		}
 	}
 	if labelsUpdated {
 		r.resyncClusterQueueGaugeMetrics(current)

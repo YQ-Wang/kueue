@@ -331,13 +331,6 @@ func (m *Manager) AddClusterQueue(ctx context.Context, cq *kueue.ClusterQueue) e
 	return m.addClusterQueueLocked(ctx, cq, true)
 }
 
-// ReplaceClusterQueue stages the observed ClusterQueue before swapping it into
-// the queue manager.
-func (m *Manager) ReplaceClusterQueue(ctx context.Context, cq *kueue.ClusterQueue) error {
-	_, err := m.EnsureClusterQueueIncarnation(ctx, cq)
-	return err
-}
-
 // EnsureClusterQueueIncarnation stages the observed ClusterQueue before swapping
 // it into the queue manager. It reports whether the cached incarnation changed.
 func (m *Manager) EnsureClusterQueueIncarnation(ctx context.Context, cq *kueue.ClusterQueue) (bool, error) {
@@ -557,8 +550,14 @@ func (m *Manager) RebuildClusterQueue(log logr.Logger, cq *kueue.ClusterQueue, l
 }
 
 // DeleteClusterQueue removes the cached ClusterQueue when the UID matches.
-// It returns false only when the name is occupied by a different incarnation.
-func (m *Manager) DeleteClusterQueue(log logr.Logger, cq *kueue.ClusterQueue) bool {
+func (m *Manager) DeleteClusterQueue(log logr.Logger, cq *kueue.ClusterQueue) {
+	m.DeleteClusterQueueIfUIDMatches(log, cq)
+}
+
+// DeleteClusterQueueIfUIDMatches removes the cached ClusterQueue when the UID
+// matches. It returns false only when the name is occupied by a different
+// incarnation.
+func (m *Manager) DeleteClusterQueueIfUIDMatches(log logr.Logger, cq *kueue.ClusterQueue) bool {
 	m.Lock()
 	defer m.Unlock()
 	cqImpl := m.hm.ClusterQueue(kueue.ClusterQueueReference(cq.Name))
@@ -576,14 +575,13 @@ func (m *Manager) DeleteClusterQueue(log logr.Logger, cq *kueue.ClusterQueue) bo
 // a UID check. Callers must serialize both caches and use this only after the
 // scheduler cache reports that it removed the authoritative incarnation or
 // aborted a transition which still retained the old incarnation.
-func (m *Manager) DeleteClusterQueueForCacheConvergence(log logr.Logger, cqName kueue.ClusterQueueReference) bool {
+func (m *Manager) DeleteClusterQueueForCacheConvergence(log logr.Logger, cqName kueue.ClusterQueueReference) {
 	m.Lock()
 	defer m.Unlock()
 	cqImpl := m.hm.ClusterQueue(cqName)
 	if cqImpl != nil {
 		m.deleteClusterQueueLocked(log, cqImpl)
 	}
-	return true
 }
 
 func (m *Manager) deleteClusterQueueLocked(log logr.Logger, cq *ClusterQueue) {

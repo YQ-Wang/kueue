@@ -25,6 +25,36 @@ import (
 	"sigs.k8s.io/kueue/pkg/resources"
 )
 
+// clearClusterQueueRemovalMetricsLocked clears gauge dimensions that are owned
+// by a ClusterQueue while its cohort ancestry is still available. The caller
+// records the affected cohorts again after removing or replacing the queue.
+func (c *Cache) clearClusterQueueRemovalMetricsLocked(cq *clusterQueue) sets.Set[kueue.CohortReference] {
+	metrics.ClearClusterQueueResourceMetrics(string(cq.Name))
+
+	affectedCohorts := cohortsForClusterQueue(cq)
+	for cohortName := range affectedCohorts {
+		// Clear by cohort name rather than by the current resource tree so flavor
+		// and resource dimensions that exist only in the old incarnation are
+		// removed as well.
+		metrics.ClearCohortMetrics(cohortName)
+	}
+	return affectedCohorts
+}
+
+func (c *Cache) resyncCohortGaugeMetricsForNamesLocked(log logr.Logger, cohortNames sets.Set[kueue.CohortReference]) {
+	for cohortName := range cohortNames {
+		c.resyncCohortGaugeMetricsLocked(log, cohortName)
+	}
+}
+
+func cohortsForClusterQueue(cq *clusterQueue) sets.Set[kueue.CohortReference] {
+	cohorts := sets.New[kueue.CohortReference]()
+	for cohort := cq.Parent(); cohort != nil && !cohorts.Has(cohort.Name); cohort = cohort.Parent() {
+		cohorts.Insert(cohort.Name)
+	}
+	return cohorts
+}
+
 func (c *Cache) RecordClusterQueueResourceMetrics(log logr.Logger, cqName kueue.ClusterQueueReference) {
 	log.V(4).Info("Recording resource metrics for ClusterQueue")
 

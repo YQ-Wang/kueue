@@ -323,7 +323,7 @@ func TestReplaceClusterQueuePreservesPersistedRequeueGates(t *testing.T) {
 		t.Fatalf("Unexpected inadmissible workloads before replacement (-want,+got):\n%s", diff)
 	}
 
-	if err := manager.ReplaceClusterQueue(ctx, newCQ); err != nil {
+	if _, err := manager.EnsureClusterQueueIncarnation(ctx, newCQ); err != nil {
 		t.Fatalf("Replacing ClusterQueue: %v", err)
 	}
 	if diff := cmp.Diff(wantActive, manager.Dump(), cmpDump...); diff != "" {
@@ -387,7 +387,7 @@ func TestReplaceClusterQueueNotifiesFormerAndCurrentCohortRoots(t *testing.T) {
 	newCQ := oldCQ.DeepCopy()
 	newCQ.UID = "new"
 	newCQ.Spec.CohortName = "new-root"
-	if err := manager.ReplaceClusterQueue(ctx, newCQ); err != nil {
+	if _, err := manager.EnsureClusterQueueIncarnation(ctx, newCQ); err != nil {
 		t.Fatalf("Replacing ClusterQueue: %v", err)
 	}
 	wantNotifiedRoots := sets.New[kueue.CohortReference]("old-root", "new-root")
@@ -430,7 +430,7 @@ func TestAddClusterQueueAfterDeleteResetsLastAssignment(t *testing.T) {
 		ClusterQueueGeneration: 10,
 	}
 
-	if deleted := manager.DeleteClusterQueue(log, oldCQ); !deleted {
+	if deleted := manager.DeleteClusterQueueIfUIDMatches(log, oldCQ); !deleted {
 		t.Fatal("Deleting old ClusterQueue was rejected")
 	}
 	if err := manager.AddClusterQueue(ctx, newCQ); err != nil {

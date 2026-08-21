@@ -124,6 +124,7 @@ func managerAndControllerSetup(
 		}
 
 		cacheOpts := []schdcache.Option{
+			schdcache.WithAPIReader(mgr.GetAPIReader()),
 			schdcache.WithResourceMetrics(controllersCfg.Metrics.EnableClusterQueueResources),
 			schdcache.WithRoleTracker(opts.roleTracker),
 			schdcache.WithLocalQueueMetrics(lqMetrics),

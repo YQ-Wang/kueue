@@ -103,6 +103,68 @@ func TestCompleteClusterQueueReplacementPublishesAdmittedMetricsOnce(t *testing.
 	}
 }
 
+func TestReplaceClusterQueueRebuildsResourceAndCohortDimensions(t *testing.T) {
+	metrics.InitMetricVectors(nil)
+	defer metrics.InitMetricVectors(nil)
+
+	oldCQ := utiltestingapi.MakeClusterQueue("cq").
+		Cohort("child").
+		ResourceGroup(*utiltestingapi.MakeFlavorQuotas("old-flavor").Resource(corev1.ResourceCPU, "10").Obj()).
+		Obj()
+	oldCQ.UID = "old"
+	newCQ := utiltestingapi.MakeClusterQueue("cq").
+		Cohort("child").
+		ResourceGroup(*utiltestingapi.MakeFlavorQuotas("new-flavor").Resource(corev1.ResourceCPU, "20").Obj()).
+		Obj()
+	newCQ.UID = "new"
+
+	cache := New(utiltesting.NewClientBuilder().WithObjects(newCQ).Build(), WithResourceMetrics(true))
+	ctx, log := utiltesting.ContextWithLog(t)
+	cache.AddOrUpdateResourceFlavor(log, utiltestingapi.MakeResourceFlavor("old-flavor").Obj())
+	cache.AddOrUpdateResourceFlavor(log, utiltestingapi.MakeResourceFlavor("new-flavor").Obj())
+	if err := cache.AddOrUpdateCohort(utiltestingapi.MakeCohort("root").Obj()); err != nil {
+		t.Fatalf("Adding root Cohort: %v", err)
+	}
+	if err := cache.AddOrUpdateCohort(utiltestingapi.MakeCohort("child").Parent("root").Obj()); err != nil {
+		t.Fatalf("Adding child Cohort: %v", err)
+	}
+	if err := cache.AddClusterQueue(ctx, oldCQ); err != nil {
+		t.Fatalf("Adding old ClusterQueue: %v", err)
+	}
+	cache.RecordClusterQueueResourceMetrics(log, kueue.ClusterQueueReference(oldCQ.Name))
+	cache.RecordCohortMetrics(log, oldCQ.Spec.CohortName)
+
+	assertSingleFlavor := func(t *testing.T, points []testingmetrics.MetricDataPoint, wantFlavor string) {
+		t.Helper()
+		if len(points) != 1 || points[0].Labels["flavor"] != wantFlavor {
+			t.Fatalf("Metric points = %+v, want one point for flavor %q", points, wantFlavor)
+		}
+	}
+	clusterQueueQuota := func() []testingmetrics.MetricDataPoint {
+		return testingmetrics.CollectFilteredGaugeVec(metrics.ClusterQueueResourceNominalQuota, map[string]string{"cluster_queue": oldCQ.Name})
+	}
+	cohortQuota := func(name string) []testingmetrics.MetricDataPoint {
+		return testingmetrics.CollectFilteredGaugeVec(metrics.CohortSubtreeQuota, map[string]string{"cohort": name})
+	}
+	assertSingleFlavor(t, clusterQueueQuota(), "old-flavor")
+	assertSingleFlavor(t, cohortQuota("child"), "old-flavor")
+	assertSingleFlavor(t, cohortQuota("root"), "old-flavor")
+
+	if pending, err := cache.ReplaceClusterQueue(ctx, newCQ); err != nil || !pending {
+		t.Fatalf("Replacing ClusterQueue: pending=%t, error=%v", pending, err)
+	}
+	if points := clusterQueueQuota(); len(points) != 0 {
+		t.Fatalf("Pending replacement retained old ClusterQueue resource dimensions: %+v", points)
+	}
+	assertSingleFlavor(t, cohortQuota("child"), "new-flavor")
+	assertSingleFlavor(t, cohortQuota("root"), "new-flavor")
+
+	if !cache.CompleteClusterQueueReplacement(kueue.ClusterQueueReference(newCQ.Name), newCQ.UID) {
+		t.Fatal("Completing ClusterQueue replacement")
+	}
+	assertSingleFlavor(t, clusterQueueQuota(), "new-flavor")
+}
+
 func TestResyncClusterQueueGaugeMetricsUsesUpdatedCustomLabels(t *testing.T) {
 	ctx, log := utiltesting.ContextWithLog(t)
 	defer metrics.InitMetricVectors(nil)

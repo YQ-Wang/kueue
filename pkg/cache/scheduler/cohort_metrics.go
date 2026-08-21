@@ -47,7 +47,13 @@ func (c *Cache) RecordCohortMetrics(log logr.Logger, cohortName kueue.CohortRefe
 	log = c.withCohortLogger(log, cohortName)
 	log.V(4).Info("Recording metrics for cohort")
 
-	points := c.collectCohortMetricPoints(cohortName, false)
+	c.RLock()
+	defer c.RUnlock()
+	c.recordCohortMetricsLocked(cohortName)
+}
+
+func (c *Cache) recordCohortMetricsLocked(cohortName kueue.CohortReference) {
+	points := c.collectCohortMetricPointsLocked(cohortName, false)
 	for _, p := range points {
 		c.applyCohortMetricPoint(p)
 	}
@@ -62,7 +68,9 @@ func (c *Cache) ClearCohortMetrics(log logr.Logger, cohortName kueue.CohortRefer
 	log = c.withCohortLogger(log, cohortName)
 	log.V(4).Info("Clearing metrics for cohort")
 
-	points := c.collectCohortMetricPoints(cohortName, true)
+	c.RLock()
+	defer c.RUnlock()
+	points := c.collectCohortMetricPointsLocked(cohortName, true)
 	for _, p := range points {
 		c.applyCohortMetricPoint(p)
 	}
@@ -74,10 +82,7 @@ func (c *Cache) ClearCohortMetrics(log logr.Logger, cohortName kueue.CohortRefer
 // the target cohort's subtree contribution from each cohort's current subtree totals.
 // This is used when clearing metrics so ancestor subtree gauges are updated too,
 // rather than left with stale values after the target cohort is removed.
-func (c *Cache) collectCohortMetricPoints(cohortName kueue.CohortReference, simulateRemoval bool) []cohortMetricPoint {
-	c.RLock()
-	defer c.RUnlock()
-
+func (c *Cache) collectCohortMetricPointsLocked(cohortName kueue.CohortReference, simulateRemoval bool) []cohortMetricPoint {
 	ch := c.hm.Cohort(cohortName)
 	if ch == nil || hierarchy.HasCycle(ch) {
 		if simulateRemoval {

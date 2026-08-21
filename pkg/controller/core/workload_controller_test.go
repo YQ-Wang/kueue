@@ -542,7 +542,8 @@ func TestAfsSettlementWaitsForWorkloadAssumptionConvergence(t *testing.T) {
 		WithStatusSubresource(&kueue.Workload{}).
 		WithInterceptorFuncs(interceptor.Funcs{SubResourcePatch: utiltesting.TreatSSAAsStrategicMerge}).
 		Build()
-	cqCache := schdcache.New(cl, schdcache.WithAPIReader(cl), schdcache.WithAdmissionFairSharing(afsConfig))
+	// An exact persisted listener observation must converge without an uncached API read.
+	cqCache := schdcache.New(cl, schdcache.WithAdmissionFairSharing(afsConfig))
 	qManager := qcache.NewManagerForUnitTests(cl, cqCache, qcache.WithAdmissionFairSharing(afsConfig))
 	reconciler := NewWorkloadReconciler(cl, qManager, cqCache, &utiltesting.EventRecorder{}, WithAdmissionFairSharing(afsConfig))
 	reconciler.clock = fakeClock
@@ -569,9 +570,6 @@ func TestAfsSettlementWaitsForWorkloadAssumptionConvergence(t *testing.T) {
 		t.Fatalf("Adding assumed Workload: added=%t, error=%v", added, err)
 	}
 	wlKey := workload.Key(assumedWorkload)
-	if !cqCache.MarkWorkloadAssumptionPersisted(log, wlKey, assumedWorkload.UID, "persisted-before-observation") {
-		t.Fatal("Marking Workload assumption persisted")
-	}
 	lqKey := utilqueue.Key(lq)
 	penalty := afs.CalculateEntryPenalty(workload.NewInfo(assumedWorkload).SumTotalRequests(reconciler.resourceFormatter), afsConfig)
 	qManager.AfsUsageLedger.PushPenaltyForWorkload(lqKey, queueafs.WorkloadReference(wlKey), assumedWorkload.UID, penalty, start)
@@ -591,6 +589,18 @@ func TestAfsSettlementWaitsForWorkloadAssumptionConvergence(t *testing.T) {
 		t.Fatal("AFS usage entry missing before convergence")
 	} else if cpu := entry.Resources[corev1.ResourceCPU]; !cpu.IsZero() {
 		t.Fatalf("Consumed CPU before convergence = %s, want 0", cpu.String())
+	}
+	if observedWorkload.ResourceVersion == "" {
+		t.Fatal("Observed Workload has an empty resource version")
+	}
+	if !cqCache.MarkWorkloadAssumptionPersisted(log, wlKey, assumedWorkload.UID, observedWorkload.ResourceVersion) {
+		t.Fatal("Marking Workload assumption persisted")
+	}
+	if !cqCache.WorkloadAssumptionPending(wlKey) {
+		t.Fatal("Persisted mark consumed the retained listener observation outside reconciliation")
+	}
+	if !qManager.AfsUsageLedger.HasPendingPenalty(lqKey) {
+		t.Fatal("Persisted mark settled the penalty outside reconciliation")
 	}
 
 	request := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(observedWorkload)}

@@ -57,7 +57,7 @@ var (
 	ErrCqNotFound     = errors.New("cluster queue not found")
 	ErrCqUIDMismatch  = errors.New("cluster queue UID does not match cached incarnation")
 	ErrCqAssumptions  = errors.New("cluster queue has unresolved workload assumptions")
-	ErrCqNotActive    = errors.New("cluster queue is not active")
+	errCqNotActive    = errors.New("cluster queue is not active")
 	errQNotFound      = errors.New("queue not found")
 )
 
@@ -287,9 +287,10 @@ func (c *Cache) applyWorkloadAssumptionObservation(log logr.Logger, wlKey worklo
 	return updated, nil
 }
 
-// ConvergeWorkloadAssumption verifies a retained listener observation against
-// the uncached API reader and, once they agree, applies it to the scheduler
-// cache. The API read intentionally happens without holding the cache lock.
+// ConvergeWorkloadAssumption applies a retained listener observation for the
+// persisted resource version. A coalesced later observation is first verified
+// against the uncached API reader. The API read intentionally happens without
+// holding the cache lock.
 //
 // pending is true while an assumption still needs either the admission patch's
 // resource version, a matching listener observation, or a successful API read.
@@ -309,14 +310,17 @@ func (c *Cache) ConvergeWorkloadAssumption(ctx context.Context, log logr.Logger,
 	}
 	observed := assumption.latestObserved.DeepCopy()
 	workloadUID := assumption.workloadUID
+	persistedResourceVersion := assumption.persistedResourceVersion
 	c.RUnlock()
 
-	observationCurrent, err := c.workloadObservationIsCurrentInAPI(ctx, observed)
-	if err != nil {
-		return false, true, err
-	}
-	if !observationCurrent {
-		return false, true, nil
+	if observed.ResourceVersion != persistedResourceVersion {
+		observationCurrent, err := c.workloadObservationIsCurrentInAPI(ctx, observed)
+		if err != nil {
+			return false, true, err
+		}
+		if !observationCurrent {
+			return false, true, nil
+		}
 	}
 	updated, err = c.applyWorkloadAssumptionObservation(log, wlKey, workloadUID, observed.ResourceVersion)
 	if err != nil {
@@ -728,7 +732,9 @@ func (c *Cache) ReplaceClusterQueue(ctx context.Context, cq *kueue.ClusterQueue)
 		return true, err
 	}
 
+	affectedCohorts := sets.New[kueue.CohortReference]()
 	if cqImpl != nil {
+		affectedCohorts = c.clearClusterQueueRemovalMetricsLocked(cqImpl)
 		c.deleteClusterQueueLocked(log, cqImpl)
 	}
 	replacement.replacementPending = true
@@ -750,6 +756,12 @@ func (c *Cache) ReplaceClusterQueue(ctx context.Context, cq *kueue.ClusterQueue)
 		}
 		c.workloadAssignedQueues[workload.Key(&workloads[i])] = replacement.Name
 		replacement.addOrUpdateWorkload(wlLog, &workloads[i])
+	}
+	if cqImpl != nil {
+		for cohortName := range cohortsForClusterQueue(replacement) {
+			affectedCohorts.Insert(cohortName)
+		}
+		c.resyncCohortGaugeMetricsForNamesLocked(log, affectedCohorts)
 	}
 	return true, nil
 }
@@ -969,9 +981,13 @@ func (c *Cache) ResyncLocalQueueGaugeMetrics(cqName kueue.ClusterQueueReference,
 }
 
 func (c *Cache) ResyncCohortGaugeMetrics(log logr.Logger, cohortName kueue.CohortReference) {
-	c.RecordCohortMetrics(log, cohortName)
 	c.RLock()
 	defer c.RUnlock()
+	c.resyncCohortGaugeMetricsLocked(log, cohortName)
+}
+
+func (c *Cache) resyncCohortGaugeMetricsLocked(log logr.Logger, cohortName kueue.CohortReference) {
+	c.recordCohortMetricsLocked(cohortName)
 	cohort := c.hm.Cohort(cohortName)
 	if cohort == nil || hierarchy.HasCycle(cohort) {
 		return
@@ -988,9 +1004,9 @@ func (c *Cache) ResyncCohortGaugeMetrics(log logr.Logger, cohortName kueue.Cohor
 }
 
 // DeleteClusterQueue removes the cached ClusterQueue unless the event is stale
-// for the current replacement lifecycle. It returns false for ignored events.
-func (c *Cache) DeleteClusterQueue(cq *kueue.ClusterQueue) bool {
-	return c.DeleteClusterQueueWithResult(cq).Deleted()
+// for the current replacement lifecycle.
+func (c *Cache) DeleteClusterQueue(cq *kueue.ClusterQueue) {
+	c.DeleteClusterQueueWithResult(cq)
 }
 
 // DeleteClusterQueueWithResult additionally identifies deletion of a target
@@ -1011,7 +1027,9 @@ func (c *Cache) DeleteClusterQueueWithResult(cq *kueue.ClusterQueue) ClusterQueu
 			case curCq.replacementTargetUID:
 				// Preparation failed before the target incarnation was installed.
 				// Its deletion aborts the transition and removes the frozen old state.
+				affectedCohorts := c.clearClusterQueueRemovalMetricsLocked(curCq)
 				c.deleteClusterQueueLocked(logr.Discard(), curCq)
+				c.resyncCohortGaugeMetricsForNamesLocked(logr.Discard(), affectedCohorts)
 				c.clusterQueueIncarnationEpoch++
 				return ClusterQueueDeleteReplacementAborted
 			case curCq.UID:
@@ -1026,7 +1044,9 @@ func (c *Cache) DeleteClusterQueueWithResult(cq *kueue.ClusterQueue) ClusterQueu
 			return ClusterQueueDeleteIgnored
 		}
 	}
+	affectedCohorts := c.clearClusterQueueRemovalMetricsLocked(curCq)
 	c.deleteClusterQueueLocked(logr.Discard(), curCq)
+	c.resyncCohortGaugeMetricsForNamesLocked(logr.Discard(), affectedCohorts)
 	c.clusterQueueIncarnationEpoch++
 	return ClusterQueueDeleteCurrentDeleted
 }
@@ -1277,37 +1297,19 @@ func (c *Cache) AddOrUpdateWorkload(log logr.Logger, w *kueue.Workload) bool {
 // MarkWorkloadAssumptionPersisted records the API resource version returned by
 // the scheduler's admission patch. A listener event for that exact version, or
 // a coalesced later observation verified with the uncached API reader, releases
-// the assumption. If that event arrived before the patch call returned, process
-// the retained observation here.
-func (c *Cache) MarkWorkloadAssumptionPersisted(log logr.Logger, wlKey workload.Reference, workloadUID types.UID, resourceVersion string) bool {
+// the assumption through ConvergeWorkloadAssumption.
+func (c *Cache) MarkWorkloadAssumptionPersisted(_ logr.Logger, wlKey workload.Reference, workloadUID types.UID, resourceVersion string) bool {
 	if resourceVersion == "" {
 		return false
 	}
 	c.Lock()
+	defer c.Unlock()
 	assumption, found := c.workloadAssumptions[wlKey]
 	if !found || assumption.workloadUID != workloadUID {
-		c.Unlock()
 		return false
 	}
 	assumption.persistedResourceVersion = resourceVersion
 	c.workloadAssumptions[wlKey] = assumption
-	if assumption.latestObserved == nil || assumption.latestObserved.UID != workloadUID ||
-		assumption.latestObserved.ResourceVersion == "" {
-		c.Unlock()
-		return true
-	}
-	observedResourceVersion := assumption.latestObserved.ResourceVersion
-	c.Unlock()
-	if observedResourceVersion == resourceVersion {
-		if _, err := c.applyWorkloadAssumptionObservation(log, wlKey, workloadUID, observedResourceVersion); err != nil {
-			log.Error(err, "Updating persisted workload assumption in cache")
-			return false
-		}
-		return true
-	}
-	// A retained observation with a different resource version needs an
-	// uncached verification. Its Workload event already enqueued reconciliation,
-	// so leave convergence to that controller-owned retry path.
 	return true
 }
 
@@ -1327,7 +1329,7 @@ func (c *Cache) AddOrUpdateWorkloadForClusterQueueUID(log logr.Logger, w *kueue.
 		return false, fmt.Errorf("%w: cached %q, expected %q", ErrCqUIDMismatch, cq.UID, expectedUID)
 	}
 	if !cq.Active() {
-		return false, ErrCqNotActive
+		return false, errCqNotActive
 	}
 	updated, err := c.addOrUpdateWorkloadWithoutLock(log, w)
 	if err != nil || !updated {

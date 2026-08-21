@@ -66,6 +66,8 @@ const (
 	StoppedReason                  = "Stopped"
 	clusterQueueIsInactiveReason   = "ClusterQueueIsInactive"
 	clusterQueueDoesNotExistReason = "ClusterQueueDoesNotExist"
+	clusterQueueSyncPendingReason  = "ClusterQueueSynchronizationPending"
+	clusterQueueSyncPendingMsg     = "Waiting for ClusterQueue synchronization"
 )
 
 type LocalQueueReconcilerOptions struct {
@@ -198,10 +200,8 @@ func (r *LocalQueueReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	if err := r.client.Get(ctx, client.ObjectKey{Name: string(queueObj.Spec.ClusterQueue)}, &cq); err != nil {
 		if apierrors.IsNotFound(err) {
 			if stats.ClusterQueueExists {
-				if stopped {
-					if statusErr := r.applyLocalQueueCondition(ctx, &queueObj, metav1.ConditionFalse, StoppedReason, localQueueIsInactiveMsg); statusErr != nil {
-						return ctrl.Result{}, client.IgnoreNotFound(statusErr)
-					}
+				if statusErr := r.applyClusterQueueSyncPendingCondition(ctx, &queueObj, stopped); statusErr != nil {
+					return ctrl.Result{}, client.IgnoreNotFound(statusErr)
 				}
 				log.V(2).Info("ClusterQueue is absent from the API but still present in the scheduler cache; waiting for cleanup",
 					"clusterQueue", queueObj.Spec.ClusterQueue, "cacheReadError", usageErr)
@@ -219,14 +219,13 @@ func (r *LocalQueueReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	if stats.ClusterQueueExists && stats.ClusterQueueUID != cq.UID {
-		if stopped {
-			if err := r.applyLocalQueueCondition(ctx, &queueObj, metav1.ConditionFalse, StoppedReason, localQueueIsInactiveMsg); err != nil {
-				return ctrl.Result{}, client.IgnoreNotFound(err)
-			}
+	cacheSynchronizationPending := !stats.ClusterQueueExists || stats.ClusterQueueUID != cq.UID
+	if cacheSynchronizationPending {
+		if err := r.applyClusterQueueSyncPendingCondition(ctx, &queueObj, stopped); err != nil {
+			return ctrl.Result{}, client.IgnoreNotFound(err)
 		}
-		log.V(2).Info("ClusterQueue API object and scheduler cache describe different incarnations; waiting for synchronization",
-			"clusterQueue", cq.Name, "apiUID", cq.UID, "cacheUID", stats.ClusterQueueUID, "cacheReadError", usageErr)
+		log.V(2).Info("ClusterQueue API object and scheduler cache are not synchronized",
+			"clusterQueue", cq.Name, "apiUID", cq.UID, "cacheExists", stats.ClusterQueueExists, "cacheUID", stats.ClusterQueueUID, "cacheReadError", usageErr)
 		return ctrl.Result{RequeueAfter: constants.UpdatesBatchPeriod}, nil
 	}
 	if usageErr != nil {
@@ -675,6 +674,22 @@ func (r *LocalQueueReconciler) SetupWithManager(mgr ctrl.Manager, cfg *config.Co
 		Complete(WithLeadingManager(mgr, r, &kueue.LocalQueue{}, cfg))
 }
 
+// UpdateStatusIfChanged updates LocalQueue usage and its Active condition when
+// either differs from the persisted status.
+func (r *LocalQueueReconciler) UpdateStatusIfChanged(
+	ctx context.Context,
+	queue *kueue.LocalQueue,
+	conditionStatus metav1.ConditionStatus,
+	reason, msg string,
+) error {
+	stats, err := r.cache.LocalQueueUsage(queue)
+	if err != nil {
+		r.logger().Error(err, failedUpdateLqStatusMsg)
+		return err
+	}
+	return r.applyLocalQueueStatus(ctx, queue, stats, conditionStatus, reason, msg)
+}
+
 func (r *LocalQueueReconciler) applyLocalQueueStatus(
 	ctx context.Context,
 	queue *kueue.LocalQueue,
@@ -721,6 +736,13 @@ func (r *LocalQueueReconciler) applyLocalQueueCondition(
 		return r.client.Status().Update(ctx, queue)
 	}
 	return nil
+}
+
+func (r *LocalQueueReconciler) applyClusterQueueSyncPendingCondition(ctx context.Context, queue *kueue.LocalQueue, stopped bool) error {
+	if stopped {
+		return r.applyLocalQueueCondition(ctx, queue, metav1.ConditionFalse, StoppedReason, localQueueIsInactiveMsg)
+	}
+	return r.applyLocalQueueCondition(ctx, queue, metav1.ConditionFalse, clusterQueueSyncPendingReason, clusterQueueSyncPendingMsg)
 }
 
 func (r *LocalQueueReconciler) setLocalQueueCondition(
