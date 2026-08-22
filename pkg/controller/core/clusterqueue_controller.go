@@ -76,6 +76,7 @@ type ClusterQueueReconciler struct {
 	customLabels                 *metrics.CustomLabels
 	cacheMutationMu              sync.Mutex
 	pendingClusterQueueDeletions map[types.NamespacedName]map[types.UID]*kueue.ClusterQueue
+	pendingClusterQueueUpdates   map[types.NamespacedName][]*kueue.ClusterQueue
 }
 
 var _ reconcile.Reconciler = (*ClusterQueueReconciler)(nil)
@@ -163,19 +164,36 @@ func (r *ClusterQueueReconciler) logger() logr.Logger {
 // +kubebuilder:rbac:groups=kueue.x-k8s.io,resources=clusterqueues/finalizers,verbs=update
 
 func (r *ClusterQueueReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	var (
+		pendingDeletions []*kueue.ClusterQueue
+		pendingUpdates   []*kueue.ClusterQueue
+		notificationCQ   *kueue.ClusterQueue
+		cachesChanged    bool
+	)
 	r.cacheMutationMu.Lock()
-	defer r.cacheMutationMu.Unlock()
+	defer func() {
+		r.cacheMutationMu.Unlock()
+		if len(pendingDeletions) > 0 || len(pendingUpdates) > 0 {
+			r.notifyPendingClusterQueueUpdates(pendingDeletions, pendingUpdates, notificationCQ)
+		}
+		if cachesChanged && notificationCQ != nil && len(pendingUpdates) == 0 {
+			// Create and Update predicates normally notify after repairing the
+			// caches. If their repair failed, the successful reconcile is the first
+			// point at which watchers can safely observe the new state. A pending
+			// update already carries that state, while a pending deletion does not.
+			r.notifyWatchers(nil, notificationCQ)
+		}
+	}()
 
 	log := ctrl.LoggerFrom(ctx)
 	var cqObj kueue.ClusterQueue
 	if err := r.client.Get(ctx, req.NamespacedName, &cqObj); err != nil {
 		if apierrors.IsNotFound(err) {
-			r.retryPendingClusterQueueDeletionsLocked(log, req.NamespacedName)
+			pendingDeletions, pendingUpdates = r.retryPendingClusterQueueDeletionsLocked(log, req.NamespacedName)
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
 	}
-	r.clearPendingClusterQueueDeletionsLocked(req.NamespacedName)
 
 	log.V(2).Info("Reconcile ClusterQueue")
 
@@ -193,10 +211,40 @@ func (r *ClusterQueueReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		defer r.resyncClusterQueueGaugeMetrics(&cqObj)
 	}
 
-	cachesChanged, err := r.repairClusterQueueCachesLocked(ctx, &cqObj)
+	var err error
+	cachesChanged, err = r.repairClusterQueueCachesLocked(ctx, &cqObj)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	pendingCurrentUpdates := r.pendingClusterQueueUpdatesForUIDLocked(req.NamespacedName, cqObj.UID)
+	if len(pendingCurrentUpdates) > 0 {
+		specUpdated := slices.ContainsFunc(pendingCurrentUpdates, func(old *kueue.ClusterQueue) bool {
+			return !equality.Semantic.DeepEqual(old.Spec, cqObj.Spec)
+		})
+		if err := r.cache.UpdateClusterQueue(log, &cqObj); err != nil {
+			return ctrl.Result{}, fmt.Errorf("updating ClusterQueue in scheduler cache: %w", err)
+		}
+		if err := r.qManager.UpdateClusterQueue(ctx, &cqObj, specUpdated); err != nil {
+			return ctrl.Result{}, fmt.Errorf("updating ClusterQueue in queue manager: %w", err)
+		}
+		oldCohorts := sets.New[kueue.CohortReference]()
+		for _, old := range pendingCurrentUpdates {
+			if old.Spec.CohortName != cqObj.Spec.CohortName {
+				oldCohorts.Insert(old.Spec.CohortName)
+			}
+		}
+		for oldCohort := range oldCohorts {
+			r.cache.ClearCohortMetrics(log, oldCohort)
+			r.cache.RecordCohortMetrics(log, oldCohort)
+		}
+		if specUpdated && r.reportResourceMetrics && !labelsUpdated && !cachesChanged {
+			metrics.ClearClusterQueueResourceMetrics(cqObj.Name)
+			r.cache.RecordClusterQueueResourceMetrics(log, kueue.ClusterQueueReference(cqObj.Name))
+		}
+	}
+	notificationCQ = cqObj.DeepCopy()
+	pendingDeletions = r.takePendingClusterQueueDeletionsLocked(req.NamespacedName, cqObj.UID, true)
+	pendingUpdates = r.takePendingClusterQueueUpdatesLocked(req.NamespacedName)
 	if cachesChanged && r.reportResourceMetrics && !labelsUpdated {
 		// A previous replacement attempt may have published metrics from the
 		// retained old incarnation before failing. Clear the full dimension set on
@@ -346,7 +394,6 @@ func (r *ClusterQueueReconciler) currentClusterQueueForEventLocked(ctx context.C
 		}
 		return nil, false, err
 	}
-	r.clearPendingClusterQueueDeletionsLocked(key)
 	if current.UID != observed.UID {
 		// The reconcile or event is stale; the current object's notification
 		// owns the transition.
@@ -456,9 +503,18 @@ func (r *ClusterQueueReconciler) Create(e event.TypedCreateEvent[*kueue.ClusterQ
 		metrics.ClearClusterQueueResourceMetrics(current.Name)
 		r.cache.RecordClusterQueueResourceMetrics(log, kueue.ClusterQueueReference(current.Name))
 	}
+	var pendingDeletions, pendingUpdates []*kueue.ClusterQueue
+	if err == nil {
+		key := client.ObjectKeyFromObject(current)
+		pendingDeletions = r.takePendingClusterQueueDeletionsLocked(key, current.UID, true)
+		pendingUpdates = r.takePendingClusterQueueUpdatesLocked(key)
+	}
 	r.cacheMutationMu.Unlock()
 
-	r.notifyWatchers(nil, current)
+	if err == nil {
+		r.notifyPendingClusterQueueUpdates(pendingDeletions, pendingUpdates, current)
+		r.notifyWatchers(nil, current)
+	}
 
 	return true
 }
@@ -466,29 +522,25 @@ func (r *ClusterQueueReconciler) Create(e event.TypedCreateEvent[*kueue.ClusterQ
 func (r *ClusterQueueReconciler) Delete(e event.TypedDeleteEvent[*kueue.ClusterQueue]) bool {
 	log := r.logger()
 	log.V(2).Info("ClusterQueue delete event", "clusterQueue", klog.KObj(e.Object))
-	// Even when a newer API incarnation makes this event ineligible for name-keyed
-	// cache cleanup, old-only ResourceFlavors, AdmissionChecks, and Cohorts still
-	// need the deletion notification. Informer delete/create callbacks are ordered,
-	// and watcher reconciliation is idempotent.
-	defer r.notifyWatchers(e.Object, nil)
 	ctx := ctrl.LoggerInto(context.Background(), log)
 	r.cacheMutationMu.Lock()
-	defer r.cacheMutationMu.Unlock()
 	key := client.ObjectKeyFromObject(e.Object)
+	r.recordPendingClusterQueueDeletionLocked(e.Object)
 	var current kueue.ClusterQueue
 	if err := r.client.Get(ctx, key, &current); err == nil {
-		r.clearPendingClusterQueueDeletionsLocked(key)
 		log.V(2).Info("Ignoring stale ClusterQueue delete event because an API incarnation exists",
 			"clusterQueue", klog.KObj(e.Object), "deletedUID", e.Object.UID, "currentUID", current.UID)
+		r.cacheMutationMu.Unlock()
 		return true
 	} else if !apierrors.IsNotFound(err) {
-		r.recordPendingClusterQueueDeletionLocked(e.Object)
 		log.Error(err, "Failed to verify ClusterQueue deletion")
+		r.cacheMutationMu.Unlock()
 		return true
 	}
 
-	r.recordPendingClusterQueueDeletionLocked(e.Object)
-	r.retryPendingClusterQueueDeletionsLocked(log, key)
+	pendingDeletions, pendingUpdates := r.retryPendingClusterQueueDeletionsLocked(log, key)
+	r.cacheMutationMu.Unlock()
+	r.notifyPendingClusterQueueUpdates(pendingDeletions, pendingUpdates, nil)
 	return true
 }
 
@@ -505,15 +557,75 @@ func (r *ClusterQueueReconciler) recordPendingClusterQueueDeletionLocked(cq *kue
 	deletions[cq.UID] = cq.DeepCopy()
 }
 
-func (r *ClusterQueueReconciler) clearPendingClusterQueueDeletionsLocked(key types.NamespacedName) {
-	delete(r.pendingClusterQueueDeletions, key)
+func (r *ClusterQueueReconciler) recordPendingClusterQueueUpdateLocked(cq *kueue.ClusterQueue) {
+	key := client.ObjectKeyFromObject(cq)
+	updates := r.pendingClusterQueueUpdates[key]
+	// Watchers derive dependency cleanup from Spec. Retain every distinct old
+	// Spec in arrival order, while coalescing status/resource-version-only events.
+	for _, pending := range updates {
+		if pending.UID == cq.UID && equality.Semantic.DeepEqual(pending.Spec, cq.Spec) {
+			return
+		}
+	}
+	if r.pendingClusterQueueUpdates == nil {
+		r.pendingClusterQueueUpdates = make(map[types.NamespacedName][]*kueue.ClusterQueue)
+	}
+	r.pendingClusterQueueUpdates[key] = append(updates, cq.DeepCopy())
 }
 
-func (r *ClusterQueueReconciler) retryPendingClusterQueueDeletionsLocked(log logr.Logger, key types.NamespacedName) {
-	deletions := r.pendingClusterQueueDeletions[key]
-	delete(r.pendingClusterQueueDeletions, key)
+func (r *ClusterQueueReconciler) pendingClusterQueueUpdatesForUIDLocked(key types.NamespacedName, uid types.UID) []*kueue.ClusterQueue {
+	var updates []*kueue.ClusterQueue
+	for _, cq := range r.pendingClusterQueueUpdates[key] {
+		if cq.UID == uid {
+			updates = append(updates, cq)
+		}
+	}
+	return updates
+}
+
+func (r *ClusterQueueReconciler) takePendingClusterQueueDeletionsLocked(key types.NamespacedName, currentUID types.UID, discardCurrentUID bool) []*kueue.ClusterQueue {
+	deletionsByUID := r.pendingClusterQueueDeletions[key]
+	deletions := make([]*kueue.ClusterQueue, 0, len(deletionsByUID))
+	for uid, cq := range deletionsByUID {
+		if discardCurrentUID && uid == currentUID {
+			delete(deletionsByUID, uid)
+			continue
+		}
+		deletions = append(deletions, cq)
+		delete(deletionsByUID, uid)
+	}
+	if len(deletionsByUID) == 0 {
+		delete(r.pendingClusterQueueDeletions, key)
+	}
+	return deletions
+}
+
+func (r *ClusterQueueReconciler) takePendingClusterQueueUpdatesLocked(key types.NamespacedName) []*kueue.ClusterQueue {
+	updates := r.pendingClusterQueueUpdates[key]
+	delete(r.pendingClusterQueueUpdates, key)
+	return updates
+}
+
+func (r *ClusterQueueReconciler) retryPendingClusterQueueDeletionsLocked(log logr.Logger, key types.NamespacedName) ([]*kueue.ClusterQueue, []*kueue.ClusterQueue) {
+	deletions := r.takePendingClusterQueueDeletionsLocked(key, "", false)
+	updates := r.takePendingClusterQueueUpdatesLocked(key)
+	if len(deletions) == 0 && len(updates) == 0 {
+		return nil, nil
+	}
+
+	// The API read proved the name is absent, so an empty UID authorizes
+	// removing any cached incarnation. Replaying only the observed UIDs could
+	// leave a newer cached incarnation behind if its delete callback was delayed.
+	r.deleteClusterQueueCachesLocked(log, &kueue.ClusterQueue{ObjectMeta: metav1.ObjectMeta{Name: key.Name}})
+	return deletions, updates
+}
+
+func (r *ClusterQueueReconciler) notifyPendingClusterQueueUpdates(deletions, updates []*kueue.ClusterQueue, current *kueue.ClusterQueue) {
 	for _, cq := range deletions {
-		r.deleteClusterQueueCachesLocked(log, cq)
+		r.notifyWatchers(cq, nil)
+	}
+	for _, cq := range updates {
+		r.notifyWatchers(cq, current)
 	}
 }
 
@@ -562,10 +674,12 @@ func (r *ClusterQueueReconciler) Update(e event.TypedUpdateEvent[*kueue.ClusterQ
 	current, matches, err := r.currentClusterQueueForEventLocked(ctx, e.ObjectNew)
 	if err != nil {
 		log.Error(err, "Failed to verify current ClusterQueue incarnation")
+		r.recordPendingClusterQueueUpdateLocked(e.ObjectOld)
 		r.cacheMutationMu.Unlock()
 		return true
 	}
 	if !matches || !current.DeletionTimestamp.IsZero() {
+		r.recordPendingClusterQueueUpdateLocked(e.ObjectOld)
 		r.cacheMutationMu.Unlock()
 		return true
 	}
@@ -581,28 +695,36 @@ func (r *ClusterQueueReconciler) Update(e event.TypedUpdateEvent[*kueue.ClusterQ
 	}
 
 	var cachesChanged bool
+	notifyUpdate := true
 	if incarnationChanged {
 		var err error
 		cachesChanged, err = r.repairClusterQueueCachesLocked(ctx, current)
 		if err != nil {
 			log.Error(err, "Failed to replace ClusterQueue caches")
+			r.recordPendingClusterQueueUpdateLocked(e.ObjectOld)
+			notifyUpdate = false
 		}
 	} else {
 		if err := r.cache.UpdateClusterQueue(log, current); err != nil {
 			log.Error(err, "Failed to update clusterQueue in cache")
+			notifyUpdate = false
 		}
 		if err := r.qManager.UpdateClusterQueue(context.Background(), current, specUpdated); err != nil {
 			log.Error(err, "Failed to update clusterQueue in queue manager")
+			notifyUpdate = false
+		}
+		if !notifyUpdate {
+			r.recordPendingClusterQueueUpdateLocked(e.ObjectOld)
 		}
 	}
 
-	if e.ObjectOld.Spec.CohortName != current.Spec.CohortName {
+	if notifyUpdate && e.ObjectOld.Spec.CohortName != current.Spec.CohortName {
 		// refresh metrics - clear existing series for the cohort and record current values from cache state
 		r.cache.ClearCohortMetrics(log, e.ObjectOld.Spec.CohortName)
 		r.cache.RecordCohortMetrics(log, e.ObjectOld.Spec.CohortName)
 	}
 
-	if r.reportResourceMetrics && !labelsUpdated {
+	if notifyUpdate && r.reportResourceMetrics && !labelsUpdated {
 		if incarnationChanged {
 			if cachesChanged {
 				metrics.ClearClusterQueueResourceMetrics(current.Name)
@@ -615,9 +737,18 @@ func (r *ClusterQueueReconciler) Update(e event.TypedUpdateEvent[*kueue.ClusterQ
 	if labelsUpdated {
 		r.resyncClusterQueueGaugeMetrics(current)
 	}
+	var pendingDeletions, pendingUpdates []*kueue.ClusterQueue
+	if notifyUpdate {
+		key := client.ObjectKeyFromObject(current)
+		pendingDeletions = r.takePendingClusterQueueDeletionsLocked(key, current.UID, true)
+		pendingUpdates = r.takePendingClusterQueueUpdatesLocked(key)
+	}
 	r.cacheMutationMu.Unlock()
 
-	r.notifyWatchers(e.ObjectOld, current)
+	r.notifyPendingClusterQueueUpdates(pendingDeletions, pendingUpdates, current)
+	if notifyUpdate {
+		r.notifyWatchers(e.ObjectOld, current)
+	}
 	return true
 }
 
